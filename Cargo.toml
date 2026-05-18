@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/desktop/src-tauri",
+  "crates/core",
+  "crates/android",
+  "crates/ios",
+  "crates/storage",
+  "crates/schema",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.77"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+futures-core = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+smallvec = { version = "1", features = ["serde"] }
+tokio-rusqlite = { version = "0.6", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+idevice = { version = "0.1.61", features = [
+  "usbmuxd",
+  "pair",
+  "dvt",
+  "application_listing",
+  "sysmontap",
+  "device_info",
+  "graphics",
+  "installation_proxy",
+  "rsd",
+  "xpc",
+  "core_device_proxy",
+  "tunnel_tcp_stack",
+  "syslog_relay",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# Internal
+mperf-core = { path = "crates/core" }
+mperf-android = { path = "crates/android" }
+mperf-ios = { path = "crates/ios" }
+mperf-storage = { path = "crates/storage" }
+mperf-schema = { path = "crates/schema" }
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true

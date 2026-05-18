@@ -1,0 +1,13 @@
+// Arco Tabs renders an absolute baseline at the bottom of its header
+// strip (`.arco-tabs-header-nav::before`). Inside the 48px-tall Layout
+// Header, the strip is vertically centered, so that baseline lands ~8px
+// above the Header's own border-bottom — producing the visible "two
+// horizontal lines below the tabs" effect. We keep the Header border
+// (it spans the full width including Title and "phase 0b" on the right),
+// and suppress only the tabs' internal baseline. The active-tab "ink"
+// indicator is a separate element and stays intact.
+.topTabs {
+  :global(.arco-tabs-header-nav)::before {
+    display: none;
+  }
+}

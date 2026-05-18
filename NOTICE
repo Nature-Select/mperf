@@ -1,0 +1,45 @@
+mperf
+Copyright 2026 mperf contributors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+----------------------------------------------------------------------
+
+Trademark notice
+
+"PerfDog" is a registered trademark of Tencent Holdings Limited. mperf
+is an independent open-source project not affiliated with, endorsed by,
+or sponsored by Tencent. References to PerfDog throughout this codebase
+are descriptive (nominative use) — they identify the conventions and
+terminology this project's metrics align with, for the benefit of users
+familiar with the field. mperf was implemented from public sources only:
+
+  - Apple Instruments / DTX (sysmontap, processcontrol, graphics) — via
+    the open-source `idevice` Rust crate
+  - Android `adb` shell surface (dumpsys, /proc, SurfaceFlinger)
+  - Public algorithm conventions (e.g. the three-tier jank classifier
+    derived from frame-pacing literature)
+
+No code, binaries, decompiled artifacts, or proprietary documentation
+from any third-party performance product was used or referenced during
+development.
+
+----------------------------------------------------------------------
+
+Third-party software
+
+mperf bundles or links against the following third-party software at
+runtime or build time. See each component's repository for its full
+license terms.
+
+  - Tauri (https://tauri.app)                           — MIT / Apache-2.0
+  - idevice (https://github.com/jkcoxson/idevice)       — MIT
+  - tokio (https://tokio.rs)                            — MIT
+  - rusqlite / tokio-rusqlite                           — MIT
+  - React + Vite + Arco Design + uPlot                  — MIT (each)
+  - Android Platform Tools (`adb`, bundled as sidecar)  — Apache-2.0
+    Distributed unmodified from https://developer.android.com/tools/releases/platform-tools

@@ -1,0 +1,49 @@
+# Node
+node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Rust / Cargo
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Tauri build output
+apps/desktop/src-tauri/target/
+apps/desktop/src-tauri/gen/
+
+# Vite / build
+dist/
+dist-ssr/
+.vite/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+.DS_Store
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Binaries directory: contents are large platform-specific blobs;
+# tracked via a manifest, not committed directly
+binaries/*/
+!binaries/.gitkeep
+!binaries/README.md
+
+# Tauri sidecar binaries (fetched via `pnpm fetch:adb`)
+apps/desktop/src-tauri/binaries/adb-*
+apps/desktop/src-tauri/binaries/*.dll
+apps/desktop/src-tauri/binaries/*.exe

@@ -1,0 +1,41 @@
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3491fa"/>
+      <stop offset="100%" stop-color="#7b3df5"/>
+    </linearGradient>
+  </defs>
+  <!-- Rounded square background, brand gradient (blue → purple) -->
+  <rect width="1024" height="1024" rx="200" ry="200" fill="url(#bg)"/>
+
+  <!-- Dog head (white). Floppy ears overlap the head — proper dog,
+       not a cat. The whole face sits in the upper 60% of the canvas;
+       the pulse waveform gets the bottom 25% on its own. -->
+  <g>
+    <!-- Drooping ears (rounded rectangles rotated slightly outward) -->
+    <rect x="220" y="265" width="135" height="240" rx="65" ry="65"
+          fill="white" transform="rotate(-15 287 385)"/>
+    <rect x="669" y="265" width="135" height="240" rx="65" ry="65"
+          fill="white" transform="rotate(15 737 385)"/>
+    <!-- Head circle -->
+    <circle cx="512" cy="450" r="220" fill="white"/>
+    <!-- Snout / muzzle (slightly elongated lower part) -->
+    <ellipse cx="512" cy="540" rx="135" ry="115" fill="white"/>
+    <!-- Eyes -->
+    <circle cx="425" cy="420" r="22" fill="#1d2129"/>
+    <circle cx="599" cy="420" r="22" fill="#1d2129"/>
+    <!-- Nose -->
+    <ellipse cx="512" cy="525" rx="40" ry="28" fill="#1d2129"/>
+    <!-- Mouth: small downward V -->
+    <path d="M 482 590 Q 512 615 542 590"
+          stroke="#1d2129" stroke-width="10" fill="none"
+          stroke-linecap="round"/>
+  </g>
+
+  <!-- Performance pulse waveform — own dedicated band, doesn't touch
+       the head. Includes a clear jank-style spike in the middle so the
+       "perf monitoring" metaphor reads. -->
+  <path d="M 140 830 L 320 830 L 380 740 L 440 900 L 512 700 L 584 880 L 644 770 L 704 830 L 884 830"
+        stroke="white" stroke-width="26" fill="none"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

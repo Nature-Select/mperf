@@ -1,0 +1,19 @@
+[package]
+name = "mperf-ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+futures-core = { workspace = true }
+async-trait = { workspace = true }
+async-stream = { workspace = true }
+serde = { workspace = true }
+smallvec = { workspace = true }
+tracing = { workspace = true }
+
+idevice = { workspace = true }
+plist = "1"
+mperf-schema = { workspace = true }

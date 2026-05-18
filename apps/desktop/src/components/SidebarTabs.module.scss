@@ -1,0 +1,34 @@
+// Override Arco's default left-aligned tab strip so the three tabs
+// (设备 / 设置 / 关于) span the full sidebar width equally — they need
+// to track the resize handle.
+.tabs {
+  :global(.arco-tabs-header-nav) {
+    width: 100%;
+  }
+  // Arco's `.arco-tabs-header` is `display: inline-block` by default,
+  // which means the `flex: 1` we set on `.arco-tabs-header-title`
+  // below is silently ignored (titles aren't flex children). Forcing
+  // the header itself to be a full-width flex row is what actually
+  // makes the titles split evenly. The reason "tabs equalize after
+  // dragging the sidebar" before this fix: Arco runs a ResizeObserver
+  // on the header and re-renders titles when their offsetWidth
+  // changes, but on first mount the inline-block header is
+  // content-sized and the titles never see a wide-enough box. The ink
+  // indicator is `position: absolute` and JS-positioned by
+  // offsetLeft/offsetWidth on each title, so flipping the header to
+  // flex doesn't break the active-tab underline.
+  :global(.arco-tabs-header) {
+    display: flex;
+    width: 100%;
+  }
+  :global(.arco-tabs-header-title) {
+    flex: 1;
+    text-align: center;
+    justify-content: center;
+  }
+  // Underline indicator should sit under whichever tab is active,
+  // already correct, but be explicit for the centered layout.
+  :global(.arco-tabs-header-ink) {
+    transition: left 200ms ease, width 200ms ease;
+  }
+}

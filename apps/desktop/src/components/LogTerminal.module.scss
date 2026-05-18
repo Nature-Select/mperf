@@ -1,0 +1,180 @@
+.terminal {
+  display: flex;
+  flex-direction: column;
+  background: #1e1f22;
+  border-top: 1px solid var(--color-border-2);
+  // Container height is set inline by the parent (resizable). Width
+  // tracks the chart Content area via flex.
+  min-width: 0;
+  overflow: hidden;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  background: #2b2c30;
+  border-bottom: 1px solid #3a3b3f;
+  flex-shrink: 0;
+  color: #d0d3d9;
+  font-size: 11px;
+
+  // Override Arco button colors so they sit nicely on the dark
+  // toolbar without looking like inverted-foreground accidents.
+  :global(.arco-btn-text) {
+    color: #d0d3d9;
+    &:hover {
+      color: #fff;
+      background: rgba(255, 255, 255, 0.08);
+    }
+  }
+  :global(.arco-input-inner-wrapper) {
+    background: #1e1f22;
+    border-color: #3a3b3f;
+    color: #d0d3d9;
+    input {
+      color: #d0d3d9;
+    }
+  }
+  :global(.arco-select-view) {
+    background: #1e1f22;
+    border-color: #3a3b3f;
+    color: #d0d3d9;
+  }
+}
+
+.counter {
+  margin-left: auto;
+  color: #7a7d82;
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+// Attach-state badge. Sits before .counter (which floats right via
+// margin-left: auto), so the layout is [tools…] [badge] [counter].
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.badge_waiting {
+  background: rgba(255, 180, 84, 0.12);
+  color: #ffb454;
+  border: 1px solid rgba(255, 180, 84, 0.35);
+}
+
+.badge_attached {
+  background: rgba(130, 200, 130, 0.12);
+  color: #9ad28a;
+  border: 1px solid rgba(130, 200, 130, 0.35);
+}
+
+.scroller {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  // Crucial for line wrapping behavior on long messages — without
+  // this, JSON dumps / stack traces would force horizontal scroll.
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #d0d3d9;
+  padding: 4px 10px;
+}
+
+// Fixed-width column slots so Android (with tag, no process) and iOS
+// (with process, with subsystem-tag) line up the same way. Empty
+// slots reserve their width so the message column starts at the
+// same column position on every row.
+.row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 1px 0;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.level {
+  flex-shrink: 0;
+  width: 12px;
+  text-align: center;
+  font-weight: 700;
+  color: #7a7d82;
+}
+
+// Process name slot: ~14 chars max ("com.apple.WebKit" etc. truncate).
+// Empty on Android — slot still reserves width.
+.process {
+  flex-shrink: 0;
+  width: 110px;
+  color: #c3e88d;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+// PID slot: tabular-nums for vertical alignment; 5-char wide for
+// PIDs up to 99999 (covers iOS / Android max PID ranges).
+.pid {
+  flex-shrink: 0;
+  width: 44px;
+  color: #7a7d82;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+// Tag / subsystem slot. Android tag is short ("ActivityManager"),
+// iOS subsystem can be long ("com.apple.WebKit.Loading"); 180px
+// + ellipsis trims worst case while keeping common ones visible.
+.tag {
+  flex-shrink: 0;
+  width: 180px;
+  color: #82aaff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg {
+  flex: 1;
+  min-width: 0;
+}
+
+// Level coloring — applied to the whole row so the glyph and message
+// pick up the tint together. Subtle on V/D, prominent on W/E/F.
+.level_verbose,
+.level_debug {
+  opacity: 0.7;
+}
+
+.level_warn {
+  .level,
+  .msg {
+    color: #ffb454;
+  }
+}
+
+.level_error {
+  .level,
+  .msg {
+    color: #f07178;
+  }
+}
+
+.level_fatal {
+  background: rgba(240, 113, 120, 0.12);
+  .level,
+  .msg {
+    color: #f07178;
+    font-weight: 600;
+  }
+}

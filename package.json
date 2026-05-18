@@ -1,0 +1,32 @@
+{
+  "name": "mperf",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Open-source mobile performance testing platform",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@10.33.3",
+  "scripts": {
+    "dev": "pnpm --filter @mperf/desktop dev",
+    "tauri": "pnpm --filter @mperf/desktop tauri",
+    "tauri:dev": "pnpm --filter @mperf/desktop tauri dev",
+    "tauri:build": "pnpm --filter @mperf/desktop tauri build",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "format": "prettier --write \"**/*.{ts,tsx,js,json,md,scss,css}\"",
+    "cargo:check": "cargo check --workspace --all-targets",
+    "fetch:adb": "zx script/fetch-binaries.mjs",
+    "fetch:adb:all": "zx script/fetch-binaries.mjs --all",
+    "setup": "zx script/setup.mjs",
+    "release": "zx script/release.mjs",
+    "bump": "zx script/bump-version.mjs",
+    "test": "cargo test --workspace"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3",
+    "zx": "^8.1.0"
+  },
+  "engines": {
+    "node": ">=20",
+    "pnpm": ">=9"
+  }
+}

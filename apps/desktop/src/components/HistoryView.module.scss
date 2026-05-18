@@ -1,0 +1,75 @@
+.root {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  height: 100%;
+  gap: 0;
+  // Prevent the outer container from inheriting any horizontal scroll
+  // when child detail/sidebar canvases briefly exceed their grid track
+  // during a resize tick.
+  overflow: hidden;
+}
+
+.sidebar {
+  border-right: 1px solid var(--color-border-2);
+  overflow-x: hidden;
+  overflow-y: auto;
+  height: 100%;
+}
+
+.sidebarHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--color-border-2);
+}
+
+.bulkBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: var(--color-fill-1);
+  border-bottom: 1px solid var(--color-border-2);
+}
+
+.item,
+.itemSelected {
+  cursor: pointer;
+  padding: 10px 16px !important;
+}
+
+.itemSelected {
+  background: var(--color-fill-2);
+}
+
+.empty {
+  padding: 32px 16px;
+  text-align: center;
+}
+
+.detail {
+  padding: 24px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  height: 100%;
+  // Grid items default to min-width: 0, but we keep it explicit so a
+  // future refactor that wraps .detail in flex doesn't silently
+  // reintroduce the "right pane doesn't shrink" regression.
+  min-width: 0;
+}
+
+.emptyDetail {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.meta {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-text-3);
+  margin-bottom: 16px;
+}

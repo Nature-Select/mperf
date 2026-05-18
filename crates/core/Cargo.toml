@@ -1,0 +1,20 @@
+[package]
+name = "mperf-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+mperf-schema = { workspace = true }
+mperf-android = { workspace = true }
+mperf-ios = { workspace = true }
+mperf-storage = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

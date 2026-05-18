@@ -1,0 +1,233 @@
+.chartCard {
+  background: var(--color-bg-2);
+  border: 1px solid var(--color-border-2);
+  border-radius: 10px;
+  padding: 18px 20px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+  // Block elements default min-width to 0, but spelling it out matters
+  // when the chartCard ends up inside a flex/grid item that's bumped
+  // back to min-width:auto. Without this, .stats's `minmax(110px, 1fr)`
+  // can force a chain of intrinsic widths that prevent the card from
+  // shrinking below ~5*110px on narrow content panes.
+  min-width: 0;
+}
+
+.chartHeader {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.chartTitle {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-text-1);
+  letter-spacing: 0.01em;
+}
+
+.chartSub {
+  font-size: 12px;
+  color: var(--color-text-3);
+  font-weight: 400;
+}
+
+// Responsive tile grid: autopack columns at >=110px wide each, so the
+// stats wrap to 2-3 rows on narrow content areas (small windows / wide
+// sidebar) instead of squishing past readable. The accent emphasis on
+// the primary tile (first child of every chart) is preserved via the
+// `.tile.accent` modifier rather than a hardcoded `1.4fr` first column.
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.tile {
+  background: var(--color-fill-1);
+  border-radius: 8px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tile.accent {
+  background: linear-gradient(135deg, rgba(52, 145, 250, 0.10), rgba(52, 145, 250, 0.02));
+  box-shadow: inset 2px 0 0 rgba(52, 145, 250, 0.55);
+}
+
+.label {
+  font-size: 11px;
+  color: var(--color-text-3);
+  letter-spacing: 0.02em;
+}
+
+.value {
+  font-size: 24px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-1);
+  line-height: 1.1;
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.tile.accent .value {
+  color: #1971c2;
+}
+
+.unit {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text-3);
+}
+
+.subTitle {
+  margin-top: 24px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-2);
+  letter-spacing: 0.02em;
+}
+
+div > .subTitle:first-child {
+  margin-top: 0;
+}
+
+.subCount {
+  font-weight: 400;
+  color: var(--color-text-3);
+}
+
+.empty {
+  height: 60px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-3);
+  font-size: 12px;
+  font-style: italic;
+}
+
+.coreRow {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.coreTile {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--color-fill-1);
+  border: 1px solid var(--color-border-2);
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.coreSwatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.coreLabel {
+  color: var(--color-text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.coreValue {
+  margin-left: auto;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.chartHost {
+  width: 100%;
+  // `min-width: 0` is *critical* — without it the uPlot root div's
+  // explicit pixel width (set on creation / setSize) bubbles up as
+  // the chartHost's min-content, which then bubbles up through
+  // chartCard → Content (flex item). Flex items default to
+  // `min-width: auto`, so the whole right-pane refuses to shrink
+  // when the sidebar drags wider or the window narrows. With
+  // min-width: 0 + overflow: hidden, chartHost shrinks freely,
+  // ResizeObserver fires on the dimension change, and uPlot.setSize
+  // catches up. HistoryView already worked because its grid layout
+  // (`grid-template-columns: 320px 1fr`) gives grid items min-width: 0
+  // by default — flex doesn't.
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.tooltip,
+.tooltipWide {
+  position: absolute;
+  background: rgba(28, 31, 35, 0.92);
+  color: #fff;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  pointer-events: none;
+  z-index: 10;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.tooltipTime {
+  font-size: 11px;
+  opacity: 0.75;
+  margin-bottom: 3px;
+}
+
+.tooltipRow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tooltipGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px 12px;
+}
+
+.tooltipSwatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  margin-right: 4px;
+}
+
+.tooltip.pinned {
+  border: 1px solid #ffb400;
+  background: rgba(28, 31, 35, 0.96);
+}
+
+.pinHint {
+  margin-top: 4px;
+  font-size: 10px;
+  opacity: 0.55;
+  font-style: italic;
+}
+
+.pinBar {
+  position: absolute;
+  top: 0;
+  bottom: 32px; // leave room for x-axis labels
+  width: 1px;
+  background: rgba(255, 180, 0, 0.6);
+  pointer-events: none;
+  z-index: 9;
+}
