@@ -4,7 +4,49 @@ Open-source mobile performance testing toolchain for **Android** and
 **iOS**. Built with Tauri 2 + Rust + React; ships as a single desktop
 binary, no Python / no sudo / no host daemon.
 
-## Quickstart
+## Install
+
+Download the binary for your OS from the
+[latest release](https://github.com/Nature-Select/mperf/releases/latest).
+
+### macOS
+
+Releases ship unsigned (no Apple Developer ID yet).
+On first launch Gatekeeper will say **"mperf is damaged and can't be
+opened. You should move it to the Trash."** The app isn't damaged —
+that's macOS's wording for "downloaded from the internet and not signed
+by Apple". To unblock, run once in Terminal after installing:
+
+```bash
+sudo xattr -rd com.apple.quarantine /Applications/mperf.app
+```
+
+That removes the `com.apple.quarantine` extended attribute the browser
+attached on download. After that, the app opens normally.
+
+GUI alternative: double-click → click Cancel on the dialog → open
+**System Settings → Privacy & Security**, scroll to the bottom, click
+**"Open Anyway"** next to the mperf line. Re-double-click and confirm.
+
+### Windows
+
+The `.exe` / `.msi` aren't EV-Code-Signed, so SmartScreen will show a
+blue **"Windows protected your PC"** dialog on first run. Click
+**"More info"** → **"Run anyway"**. Subsequent launches are silent.
+
+### Linux
+
+Use the package that matches your distro:
+- Debian/Ubuntu: `.deb` (`sudo apt install ./mperf_*.deb`)
+- Fedora/RHEL: `.rpm` (`sudo dnf install ./mperf-*.rpm`)
+- Anywhere: `.AppImage` (`chmod +x mperf_*.AppImage && ./mperf_*.AppImage`)
+
+For iOS device support on Linux you also need `usbmuxd`:
+```bash
+sudo apt-get install -y usbmuxd
+```
+
+## Build from source
 
 ```bash
 git clone <repo>
