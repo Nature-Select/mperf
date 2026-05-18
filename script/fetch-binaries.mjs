@@ -7,7 +7,7 @@
 //   pnpm fetch:adb            # current host platform
 //   pnpm fetch:adb --all       # macOS arm64 + macOS x64 + Linux x64 + Windows x64
 
-import { $, fs, path, chalk, argv } from 'zx'
+import { $, fs, path, chalk, argv, os } from 'zx'
 
 $.verbose = false
 
@@ -35,21 +35,32 @@ const TARGETS_ALL = [
   { os: 'win32', triple: 'x86_64-pc-windows-msvc' },
 ]
 
-async function fetchForOs(os, triple) {
-  const isWin = os === 'win32'
-  const url = PLATFORM_TOOLS_URL[os]
-  if (!url) throw new Error(`no platform-tools URL for os=${os}`)
+async function fetchForOs(targetOs, triple) {
+  const isWin = targetOs === 'win32'
+  const hostIsWin = process.platform === 'win32'
+  const url = PLATFORM_TOOLS_URL[targetOs]
+  if (!url) throw new Error(`no platform-tools URL for os=${targetOs}`)
 
-  const tmpZip = path.join('/tmp', `platform-tools-${os}.zip`)
-  const tmpDir = path.join('/tmp', `platform-tools-extract-${os}`)
+  // `/tmp` doesn't exist on Windows runners. Use the OS-native temp dir
+  // (resolves to `%TEMP%` / `/var/folders/...` / `/tmp` automatically).
+  const tmpRoot = os.tmpdir()
+  const tmpZip = path.join(tmpRoot, `platform-tools-${targetOs}.zip`)
+  const tmpDir = path.join(tmpRoot, `platform-tools-extract-${targetOs}`)
 
-  console.log(chalk.cyan(`→ ${triple}: downloading platform-tools (${os})…`))
+  console.log(chalk.cyan(`→ ${triple}: downloading platform-tools (${targetOs})…`))
   await fetchToFile(url, tmpZip)
 
   console.log(chalk.cyan(`→ ${triple}: extracting…`))
   await fs.remove(tmpDir).catch(() => {})
   await fs.ensureDir(tmpDir)
-  await $`unzip -q -o ${tmpZip} -d ${tmpDir}`
+  // Windows runners don't ship `unzip` on PATH. Use PowerShell's
+  // built-in Expand-Archive there; everywhere else use `unzip` (faster,
+  // and present on every macOS / Linux runner).
+  if (hostIsWin) {
+    await $`powershell -NoProfile -NonInteractive -Command "Expand-Archive -Force -Path '${tmpZip}' -DestinationPath '${tmpDir}'"`
+  } else {
+    await $`unzip -q -o ${tmpZip} -d ${tmpDir}`
+  }
 
   await fs.ensureDir(binariesDir)
   const binaryName = isWin ? 'adb.exe' : 'adb'
