@@ -8,6 +8,7 @@
 //   pnpm fetch:adb --all       # macOS arm64 + macOS x64 + Linux x64 + Windows x64
 
 import { $, fs, path, chalk, argv, os } from 'zx'
+import { execFileSync } from 'node:child_process'
 
 $.verbose = false
 
@@ -56,8 +57,23 @@ async function fetchForOs(targetOs, triple) {
   // Windows runners don't ship `unzip` on PATH. Use PowerShell's
   // built-in Expand-Archive there; everywhere else use `unzip` (faster,
   // and present on every macOS / Linux runner).
+  //
+  // Why execFileSync instead of zx's $: zx wraps interpolated values in
+  // POSIX-style `$'...'` quoting which PowerShell sees as literal `$'`,
+  // turning the path into a positional arg PowerShell can't bind. Going
+  // through child_process bypasses zx's quoting entirely — arguments are
+  // passed as a clean argv array, no shell parser involved.
   if (hostIsWin) {
-    await $`powershell -NoProfile -NonInteractive -Command "Expand-Archive -Force -Path '${tmpZip}' -DestinationPath '${tmpDir}'"`
+    execFileSync(
+      'powershell',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Expand-Archive -Force -LiteralPath "${tmpZip}" -DestinationPath "${tmpDir}"`,
+      ],
+      { stdio: 'inherit' },
+    )
   } else {
     await $`unzip -q -o ${tmpZip} -d ${tmpDir}`
   }
