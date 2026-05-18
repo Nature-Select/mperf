@@ -101,9 +101,12 @@ git tag v0.1.0 && git push --tags
 
 Targets:
 - macOS arm64 (`aarch64-apple-darwin`) — Apple Silicon
-- macOS x64 (`x86_64-apple-darwin`) — Intel
 - Linux x64 (`x86_64-unknown-linux-gnu`)
 - Windows x64 (`x86_64-pc-windows-msvc`)
+
+Intel Macs are not in the prebuilt matrix (GitHub Actions `macos-13`
+runners now queue for 30min+ as Apple finishes the Silicon transition).
+Build from source via `pnpm release` on an Intel Mac if needed.
 
 You can also trigger the workflow manually from the Actions tab.
 
