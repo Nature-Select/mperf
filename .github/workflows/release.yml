@@ -70,7 +70,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            apps/desktop/src-tauri/target
+            target
           key: ${{ matrix.triple }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - uses: pnpm/action-setup@v3
@@ -108,14 +108,14 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           mkdir -p artifacts
-          find apps/desktop/src-tauri/target/${{ matrix.triple }}/release/bundle \
+          find target/${{ matrix.triple }}/release/bundle \
             \( -name '*.dmg' -o -name '*.app.tar.gz' \) -exec cp {} artifacts/ \;
 
       - name: Collect artifacts (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p artifacts
-          find apps/desktop/src-tauri/target/${{ matrix.triple }}/release/bundle \
+          find target/${{ matrix.triple }}/release/bundle \
             \( -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) -exec cp {} artifacts/ \;
 
       - name: Collect artifacts (Windows)
@@ -123,7 +123,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifacts
-          find apps/desktop/src-tauri/target/${{ matrix.triple }}/release/bundle \
+          find target/${{ matrix.triple }}/release/bundle \
             \( -name '*.msi' -o -name '*.exe' \) -exec cp {} artifacts/ \;
 
       - uses: actions/upload-artifact@v4
