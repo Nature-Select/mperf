@@ -47,3 +47,4 @@ binaries/*/
 apps/desktop/src-tauri/binaries/adb-*
 apps/desktop/src-tauri/binaries/*.dll
 apps/desktop/src-tauri/binaries/*.exe
+design/icon-candidates/
