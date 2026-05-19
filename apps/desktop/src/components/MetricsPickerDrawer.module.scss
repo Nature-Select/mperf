@@ -90,6 +90,7 @@
   display: flex;
   align-items: baseline;
   gap: 10px;
+
   // Reserve space on the right for Arco's built-in close X so the
   // title row doesn't run into it on narrow drawer widths.
   padding-right: 28px;

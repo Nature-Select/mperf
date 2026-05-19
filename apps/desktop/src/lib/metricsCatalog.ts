@@ -267,14 +267,17 @@ export function categoryOf(id: MetricCategory): CategoryDef {
   return CATEGORIES.find((c) => c.id === id) ?? CATEGORIES[CATEGORIES.length - 1]
 }
 
-/// Default selection on a fresh install: every implemented chart card.
-/// Capture items stay off — they're previewable placeholders, not
-/// something a new user expects to see populated.
+/// Default selection on a fresh install: cross-platform chart cards.
+/// `temperature` is intentionally left off — it's Android-only, so
+/// pre-selecting it would inflate the "已选 N/M" counter on an iOS
+/// device for a card that never renders. Android users can flip it on
+/// once; iOS users skip the cosmetic mismatch.
+/// Capture items also stay off — they're previewable placeholders,
+/// not something a new user expects to see populated.
 export const DEFAULT_SELECTED_IDS = new Set<string>([
   'frame',
   'cpu_usage',
   'cpu_core',
   'memory',
   'gpu',
-  'temperature',
 ])
