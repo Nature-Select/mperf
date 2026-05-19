@@ -126,15 +126,19 @@ export function listApps(deviceId: string, platform: Platform): Promise<AppInfo[
   return invoke<AppInfo[]>('list_apps', { deviceId, platform })
 }
 
+export interface DeviceField {
+  label: string
+  /// `null` is rendered as "unavailable" so the field set stays stable
+  /// across devices that don't expose a given kernel/lockdown value.
+  value: string | null
+}
+
 export interface DeviceInfoFull {
   id: string
-  platform: string
-  model: string | null
-  manufacturer: string | null
-  os_version: string | null
-  build: string | null
-  /// Per-platform extra fields surfaced as a small key-value table.
-  extra: Array<[string, string]>
+  platform: Platform
+  /// Ordered list of rows to render top-to-bottom — backend decides
+  /// order so PerfDog-style layouts stay platform-specific.
+  fields: DeviceField[]
 }
 
 export function getDeviceInfo(deviceId: string, platform: Platform): Promise<DeviceInfoFull> {

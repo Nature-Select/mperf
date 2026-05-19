@@ -13,7 +13,7 @@ pub mod sampler;
 pub mod session;
 
 pub use clock::Clock;
-pub use device::{Device, Platform, Transport};
+pub use device::{Device, DeviceField, DeviceInfo, Platform, Transport};
 pub use error::SamplerError;
 pub use log::{LogLevel, LogLine};
 pub use metric::{LabelKey, Labels, MetricKind, Sample};

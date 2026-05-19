@@ -3,7 +3,7 @@
 //! `mperf_ios`, `mperf_storage`) or to `session::start_recording`.
 
 use mperf_core::{Device, MetricKind};
-use mperf_schema::Platform;
+use mperf_schema::{DeviceInfo, Platform};
 use mperf_storage::{Marker, SamplePoint, SessionInfo};
 use serde::Serialize;
 use tauri::{AppHandle, State};
@@ -14,17 +14,6 @@ use crate::session::{self, now_ms, AppState};
 pub struct AppInfoOut {
     id: String,
     label: String,
-}
-
-#[derive(Serialize)]
-pub struct DeviceInfoOut {
-    id: String,
-    platform: String,
-    model: Option<String>,
-    manufacturer: Option<String>,
-    os_version: Option<String>,
-    build: Option<String>,
-    extra: Vec<(String, String)>,
 }
 
 #[tauri::command]
@@ -45,37 +34,15 @@ pub async fn list_devices() -> Result<Vec<Device>, String> {
 pub async fn get_device_info(
     device_id: String,
     platform: Platform,
-) -> Result<DeviceInfoOut, String> {
+) -> Result<DeviceInfo, String> {
     tracing::info!(device_id = %device_id, ?platform, "get_device_info");
     match platform {
-        Platform::Android => {
-            let info = mperf_android::device_info(&device_id)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(DeviceInfoOut {
-                id: info.id,
-                platform: info.platform,
-                model: info.model,
-                manufacturer: info.manufacturer,
-                os_version: info.os_version,
-                build: info.build,
-                extra: info.extra,
-            })
-        }
-        Platform::Ios => {
-            let info = mperf_ios::device_info(&device_id)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(DeviceInfoOut {
-                id: info.id,
-                platform: info.platform,
-                model: info.model,
-                manufacturer: info.manufacturer,
-                os_version: info.os_version,
-                build: info.build,
-                extra: info.extra,
-            })
-        }
+        Platform::Android => mperf_android::device_info(&device_id)
+            .await
+            .map_err(|e| e.to_string()),
+        Platform::Ios => mperf_ios::device_info(&device_id)
+            .await
+            .map_err(|e| e.to_string()),
     }
 }
 
