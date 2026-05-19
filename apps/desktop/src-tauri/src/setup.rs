@@ -109,18 +109,34 @@ pub fn stage_windows_dlls(app: &tauri::AppHandle, adb_path: &Path) {
     let Some(adb_dir) = adb_path.parent() else { return };
     let Ok(resource_dir) = app.path().resource_dir() else { return };
     for dll in ["AdbWinApi.dll", "AdbWinUsbApi.dll"] {
-        let src = resource_dir.join(dll);
         let dst = adb_dir.join(dll);
         if dst.exists() {
             continue;
         }
-        if !src.exists() {
-            tracing::warn!(dll, src = %src.display(), "expected adb DLL not in resources");
+        // tauri.windows.conf.json lists these as `binaries/*.dll`, and Tauri 2
+        // preserves that subpath under resource_dir. Fall back to a flat layout
+        // in case a future config change drops the prefix.
+        let candidates = [
+            resource_dir.join("binaries").join(dll),
+            resource_dir.join(dll),
+        ];
+        let Some(src) = candidates.iter().find(|p| p.exists()) else {
+            tracing::error!(
+                dll,
+                searched = ?candidates,
+                "adb DLL missing from bundled resources — adb.exe will fail to load"
+            );
             continue;
-        }
-        match std::fs::copy(&src, &dst) {
+        };
+        match std::fs::copy(src, &dst) {
             Ok(_) => tracing::info!(dll, dst = %dst.display(), "staged adb DLL"),
-            Err(e) => tracing::warn!(dll, error = %e, "copy adb DLL failed"),
+            Err(e) => tracing::error!(
+                dll,
+                src = %src.display(),
+                dst = %dst.display(),
+                error = %e,
+                "copy adb DLL failed — adb.exe will fail to load"
+            ),
         }
     }
 }
