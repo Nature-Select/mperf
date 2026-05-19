@@ -19,12 +19,8 @@ use anyhow::{Context, Result};
 use mperf_schema::{LogLevel, LogLine};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::process::{Child, ChildStdout};
 use tracing::warn;
-
-fn adb_binary() -> String {
-    std::env::var("MPERF_ADB_PATH").unwrap_or_else(|_| "adb".to_string())
-}
 
 pub struct LogcatStream {
     /// Held for the lifetime of the stream so `kill_on_drop` does its
@@ -41,7 +37,7 @@ impl LogcatStream {
     /// the stream will go silent — caller should restart the stream
     /// in that case (the desktop UI surfaces this as "Reload").
     pub async fn start(serial: &str, pid_filter: Option<i32>) -> Result<Self> {
-        let mut cmd = Command::new(adb_binary());
+        let mut cmd = crate::adb::adb_command();
         cmd.args([
             "-s",
             serial,
@@ -196,7 +192,7 @@ pub async fn pidof(serial: &str, pkg: &str) -> Result<Option<i32>> {
         warn!(pkg, "logcat: unsafe package name, refusing pidof");
         return Ok(None);
     }
-    let out = Command::new(adb_binary())
+    let out = crate::adb::adb_command()
         .args(["-s", serial, "shell", &format!("pidof {pkg}")])
         .output()
         .await

@@ -4,7 +4,6 @@ use crate::adb;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::time::Duration;
-use tokio::process::Command;
 
 /// One installed app, surfaced to the UI. Shape kept identical to the iOS
 /// variant so the frontend has one type to bind against.
@@ -16,10 +15,6 @@ pub struct AppInfo {
     /// manifest for a real label; for Phase 0e we just echo the package
     /// name so the frontend has a single rendering path.
     pub label: String,
-}
-
-fn adb_binary() -> String {
-    std::env::var("MPERF_ADB_PATH").unwrap_or_else(|_| "adb".to_string())
 }
 
 /// Best-effort launch of `pkg` on `serial` via `monkey`. PerfDog-style:
@@ -42,7 +37,7 @@ pub async fn launch_app(serial: &str, pkg: &str) -> Result<()> {
     }
     let out = tokio::time::timeout(
         Duration::from_secs(5),
-        Command::new(adb_binary())
+        adb::adb_command()
             .args([
                 "-s",
                 serial,
