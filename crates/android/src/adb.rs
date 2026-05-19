@@ -14,9 +14,25 @@ fn adb_binary() -> String {
     std::env::var("MPERF_ADB_PATH").unwrap_or_else(|_| "adb".to_string())
 }
 
+/// Build a `Command` for the bundled adb. On Windows we attach
+/// CREATE_NO_WINDOW so each spawn doesn't flash a console window —
+/// during recording the samplers fire several adb calls per second and
+/// without this flag the user sees a continuous black-window flicker.
+pub(crate) fn adb_command() -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(adb_binary());
+    #[cfg(target_os = "windows")]
+    {
+        // 0x0800_0000 = CREATE_NO_WINDOW (windows.h). Hardcoded to avoid
+        // pulling in the `windows-sys` crate for a single constant.
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
 /// Run `adb -s <serial> shell <cmd>` and return stdout as a String.
 pub async fn shell(serial: &str, cmd: &str) -> Result<String, SamplerError> {
-    let output = Command::new(adb_binary())
+    let output = adb_command()
         .args(["-s", serial, "shell", cmd])
         .output()
         .await
@@ -45,7 +61,7 @@ pub async fn shell(serial: &str, cmd: &str) -> Result<String, SamplerError> {
 /// Like `shell` but returns Ok even for non-typed errors (used for
 /// best-effort enrichment queries like `getprop`).
 pub async fn shell_raw(serial: &str, cmd: &str) -> Result<String> {
-    let output = Command::new(adb_binary())
+    let output = adb_command()
         .args(["-s", serial, "shell", cmd])
         .output()
         .await
@@ -66,7 +82,7 @@ pub async fn list_packages(serial: &str) -> Result<String> {
     // test e.g. the stock browser. The frontend picker filters by typing.
     // -3 limits to third-party apps. System apps (android.*, com.android.*,
     // com.sec.* on Samsung) are usually too many and not what users test.
-    let output = Command::new(adb_binary())
+    let output = adb_command()
         .args(["-s", serial, "shell", "pm list packages -3"])
         .output()
         .await
@@ -111,7 +127,7 @@ mod tests {
 
 /// Run `adb devices -l` and return raw stdout.
 pub async fn list_raw() -> Result<String> {
-    let output = Command::new(adb_binary())
+    let output = adb_command()
         .args(["devices", "-l"])
         .output()
         .await
