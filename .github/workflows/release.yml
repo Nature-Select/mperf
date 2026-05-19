@@ -3,11 +3,15 @@ name: release
 on:
   push:
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
     inputs:
       version:
         description: 'Tag this run as (e.g. v0.1.0)'
         required: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
