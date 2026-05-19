@@ -26,6 +26,8 @@ import {
   updateMarkerLabel,
 } from '@/lib/ipc'
 import { MarkerControls } from '@/lib/markers'
+import { MetricsPickerDrawer } from '@/components/MetricsPickerDrawer'
+import { ScreenTab } from '@/components/ScreenTab'
 import { LiveCpuChart } from '@/components/LiveCpuChart'
 import { LivePerCoreChart } from '@/components/LivePerCoreChart'
 import { LiveFpsChart } from '@/components/LiveFpsChart'
@@ -37,6 +39,7 @@ import { AppSelector } from '@/components/AppSelector'
 import { LogTerminal } from '@/components/LogTerminal'
 import { SidebarTabs } from '@/components/SidebarTabs'
 import { useResizableSidebar } from '@/lib/useResizableSidebar'
+import { useMetricsSelection } from '@/lib/useMetricsSelection'
 import chartStyles from '@/components/chart-shared.module.scss'
 
 const { Sider, Content } = Layout
@@ -56,6 +59,10 @@ export function LiveView({
   setActiveSessionId: (id: number | null) => void
 }) {
   const qc = useQueryClient()
+  // Drives ScreenTab visibility (and, eventually, per-chart hide gating)
+  // — every toggle in the picker writes localStorage and broadcasts a
+  // CustomEvent, so this hook stays in sync without prop drilling.
+  const { selected: metricsSelection } = useMetricsSelection()
   const { data, isLoading } = useQuery({
     queryKey: ['devices'],
     queryFn: listDevices,
@@ -596,16 +603,32 @@ export function LiveView({
           minHeight: 0,
         }}
       >
+        {/*
+          Chart-pane wrapper: a non-scrolling positioning context that
+          fills the flex slot above the log toolbar. The inner div is the
+          actual scroller — anchoring the FAB to this wrapper (instead of
+          to the scroller) keeps it pinned at the chart area's bottom-
+          right corner regardless of how far the chart list has scrolled.
+        */}
         <div
           style={{
             flex: 1,
-            overflowX: 'hidden',
-            overflowY: 'auto',
-            padding: 24,
-            minWidth: 0,
+            position: 'relative',
+            display: 'flex',
             minHeight: 0,
+            minWidth: 0,
           }}
         >
+          <div
+            style={{
+              flex: 1,
+              overflowX: 'hidden',
+              overflowY: 'auto',
+              padding: 24,
+              minWidth: 0,
+              minHeight: 0,
+            }}
+          >
         {selected ? (
           <div style={{ minWidth: 0 }}>
             {/* NoticeBanner is rendered via createPortal above — see the
@@ -631,50 +654,72 @@ export function LiveView({
                 后会自动可用。当前 iOS WiFi 入口主要为后续电量采集占位（电量必须 WiFi 测，避免 USB 充电干扰）。
               </div>
             )}
-            <LiveCpuChart active={recording} markers={markerControls} />
-            <LivePerCoreChart active={recording} markers={markerControls} />
-            <LiveFpsChart
-              active={recording}
-              platform={selected.platform}
-              markers={markerControls}
+            <ScreenTab
+              screenshotOn={metricsSelection.has('screenshot')}
+              startupTimingOn={metricsSelection.has('startup_timing')}
             />
-            <LiveGpuChart active={recording} markers={markerControls} />
-            {selected.platform === 'android' && (
-              <LiveTemperatureChart active={recording} markers={markerControls} />
-            )}
-            {!targetPkg ? (
-              <div className={chartStyles.chartCard}>
-                <div className={chartStyles.chartHeader}>
-                  <div className={chartStyles.chartTitle}>Memory</div>
-                  <div className={chartStyles.chartSub}>App PSS · MB</div>
-                </div>
-                {/* Height tuned to match LiveMemoryChart's stats(75) + chartHost(240) so
-                    the page doesn't jump when the user finally picks an app. */}
-                <div
-                  style={{
-                    height: 315,
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    background: 'var(--color-fill-1)',
-                    border: '1px dashed var(--color-border-2)',
-                    borderRadius: 8,
-                    fontSize: 13,
-                    color: 'var(--color-text-3)',
-                    lineHeight: 1.6,
-                    textAlign: 'center',
-                    padding: '0 24px',
-                  }}
-                >
-                  请先在上方选择目标 app —— CPU / FPS / 内存等都是按 app 维度采集的。
-                </div>
-              </div>
-            ) : (
-              <LiveMemoryChart
+            {/*
+              Each chart card is gated by its metrics-picker id and
+              ordered to match the picker's category order (frame → cpu
+              → memory → gpu → thermal) so opening the picker and
+              scrolling the chart list feel like the same list. The
+              corresponding sampler keeps running regardless (saves us
+              wiring the selection through start_session today); hiding
+              the card is purely a UI step.
+            */}
+            {metricsSelection.has('frame') && (
+              <LiveFpsChart
                 active={recording}
                 platform={selected.platform}
                 markers={markerControls}
               />
+            )}
+            {metricsSelection.has('cpu_usage') && (
+              <LiveCpuChart active={recording} markers={markerControls} />
+            )}
+            {metricsSelection.has('cpu_core') && (
+              <LivePerCoreChart active={recording} markers={markerControls} />
+            )}
+            {metricsSelection.has('memory') &&
+              (!targetPkg ? (
+                <div className={chartStyles.chartCard}>
+                  <div className={chartStyles.chartHeader}>
+                    <div className={chartStyles.chartTitle}>Memory</div>
+                    <div className={chartStyles.chartSub}>App PSS · MB</div>
+                  </div>
+                  {/* Height tuned to match LiveMemoryChart's stats(75) + chartHost(240) so
+                      the page doesn't jump when the user finally picks an app. */}
+                  <div
+                    style={{
+                      height: 315,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      background: 'var(--color-fill-1)',
+                      border: '1px dashed var(--color-border-2)',
+                      borderRadius: 8,
+                      fontSize: 13,
+                      color: 'var(--color-text-3)',
+                      lineHeight: 1.6,
+                      textAlign: 'center',
+                      padding: '0 24px',
+                    }}
+                  >
+                    请先在上方选择目标 app —— CPU / FPS / 内存等都是按 app 维度采集的。
+                  </div>
+                </div>
+              ) : (
+                <LiveMemoryChart
+                  active={recording}
+                  platform={selected.platform}
+                  markers={markerControls}
+                />
+              ))}
+            {metricsSelection.has('gpu') && (
+              <LiveGpuChart active={recording} markers={markerControls} />
+            )}
+            {metricsSelection.has('temperature') && selected.platform === 'android' && (
+              <LiveTemperatureChart active={recording} markers={markerControls} />
             )}
           </div>
         ) : (
@@ -687,6 +732,8 @@ export function LiveView({
             </Text>
           </div>
         )}
+          </div>
+          <MetricsPickerDrawer recording={recording} />
         </div>
 
         {/* Bottom toolbar — always present (a slim 28px strip), holds

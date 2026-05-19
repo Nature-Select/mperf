@@ -75,7 +75,26 @@ pub async fn launch_app(serial: &str, pkg: &str) -> Result<()> {
 }
 
 pub async fn list_apps(serial: &str) -> Result<Vec<AppInfo>> {
-    let raw = adb::list_packages(serial).await?;
+    // `pm list packages -3` typically returns in <100ms; the 5-second
+    // cap is purely a safety net against an adbd queue stall (we've
+    // seen these correlate with concurrent device_info shells on
+    // Samsung One UI). Without the cap the app-picker spinner can hang
+    // indefinitely if the device has any single adb operation wedged.
+    let start = std::time::Instant::now();
+    let raw = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        adb::list_packages(serial),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => anyhow::bail!("list_apps adb shell timed out after 5s"),
+    };
+    tracing::info!(
+        ms = start.elapsed().as_millis() as u64,
+        bytes = raw.len(),
+        "list_apps: shell complete"
+    );
     let mut out: Vec<AppInfo> = raw
         .lines()
         .filter_map(|line| line.trim().strip_prefix("package:").map(String::from))
