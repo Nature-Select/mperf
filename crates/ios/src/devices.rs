@@ -170,7 +170,7 @@ pub async fn device_info(udid: &str) -> Result<DeviceInfo> {
     let spec = product_type.as_deref().and_then(chipset_for);
     let cpu_type = spec.map(|s| s.cpu.to_string());
     let cpu_core_num = spec.map(|s| s.cpu_cores.to_string());
-    let cpu_freq = spec.map(|s| format!("[0,{}]", s.cpu_max_mhz));
+    let cpu_freq = spec.and_then(|s| s.cpu_max_mhz.map(|mhz| format!("[0,{}]", mhz)));
     let gpu_type = spec.map(|s| s.gpu.to_string());
 
     let fields = vec![
@@ -230,7 +230,11 @@ struct ChipsetSpec {
     /// Max P-core boost frequency, in MHz. Used for the PerfDog-style
     /// "[0,3240]" CPU Freq display — the "0" matches PerfDog's convention
     /// for "min unknown" (iOS doesn't expose live CPU frequency).
-    cpu_max_mhz: u32,
+    ///
+    /// `None` for chips where the public spec is still preliminary
+    /// (e.g. A19 / A19 Pro pre-keynote) — the field then renders as
+    /// "unavailable" instead of pretending a guess is fact.
+    cpu_max_mhz: Option<u32>,
     gpu: &'static str,
 }
 
@@ -240,7 +244,14 @@ fn chipset_for(pt: &str) -> Option<ChipsetSpec> {
     // core count exactly like PerfDog.
     macro_rules! spec {
         ($cpu:expr, $cores:expr, $max:expr, $gpu:expr) => {
-            Some(ChipsetSpec { cpu: $cpu, cpu_cores: $cores, cpu_max_mhz: $max, gpu: $gpu })
+            Some(ChipsetSpec { cpu: $cpu, cpu_cores: $cores, cpu_max_mhz: Some($max), gpu: $gpu })
+        };
+    }
+    // Variant for chips whose max-boost figure isn't publicly verified
+    // yet — keeps CPU name / core count / GPU but leaves the freq blank.
+    macro_rules! spec_no_freq {
+        ($cpu:expr, $cores:expr, $gpu:expr) => {
+            Some(ChipsetSpec { cpu: $cpu, cpu_cores: $cores, cpu_max_mhz: None, gpu: $gpu })
         };
     }
     match pt {
@@ -279,12 +290,12 @@ fn chipset_for(pt: &str) -> Option<ChipsetSpec> {
         "iPhone17,1" | "iPhone17,2" =>
             spec!("Apple A18 Pro", 6, 4040, "Apple GPU (6-Core GPU)"),
         // A19 / A19 Pro — iPhone 17 series (2025). Max-boost figures
-        // are still preliminary; refine when Apple publishes formal
-        // spec sheets and Geekbench results stabilise.
-        "iPhone18,3" => spec!("Apple A19", 6, 4040, "Apple GPU (5-Core GPU)"),
-        "iPhone18,4" => spec!("Apple A19 Pro", 6, 4040, "Apple GPU (6-Core GPU)"),
+        // aren't publicly verified yet; surface chip name / cores / GPU
+        // but show CPU Freq as "unavailable" rather than print a guess.
+        "iPhone18,3" => spec_no_freq!("Apple A19", 6, "Apple GPU (5-Core GPU)"),
+        "iPhone18,4" => spec_no_freq!("Apple A19 Pro", 6, "Apple GPU (6-Core GPU)"),
         "iPhone18,1" | "iPhone18,2" =>
-            spec!("Apple A19 Pro", 6, 4040, "Apple GPU (6-Core GPU)"),
+            spec_no_freq!("Apple A19 Pro", 6, "Apple GPU (6-Core GPU)"),
         _ => None,
     }
 }

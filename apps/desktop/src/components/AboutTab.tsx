@@ -92,11 +92,22 @@ interface DiagRowProps {
 }
 
 function DiagRow({ label, value, revealable, mono }: DiagRowProps) {
+  // Diagnostic values can be placeholders (`—` while loading,
+  // `(unavailable)` when a backend probe failed) — Reveal-in-Finder /
+  // Clipboard on those produces no useful path, so gate the actions.
+  const isPlaceholder =
+    value === '—' || value === '(unavailable)' || value.trim().length === 0
+  const canReveal = !!revealable && !isPlaceholder
   const copy = () => {
+    if (isPlaceholder) return
     void navigator.clipboard.writeText(value)
   }
   const open = () => {
-    void revealPath(value)
+    if (!canReveal) return
+    revealPath(value).catch(() => {
+      // Best-effort — the OS file manager refusing to open is not
+      // worth a toast (user can always copy the path manually).
+    })
   }
   return (
     <div
@@ -128,10 +139,17 @@ function DiagRow({ label, value, revealable, mono }: DiagRowProps) {
             size="mini"
             icon={<FolderOpen size={11} />}
             onClick={open}
+            disabled={!canReveal}
             title="Open in file manager"
           />
         )}
-        <Button size="mini" icon={<Copy size={11} />} onClick={copy} title="Copy" />
+        <Button
+          size="mini"
+          icon={<Copy size={11} />}
+          onClick={copy}
+          disabled={isPlaceholder}
+          title="Copy"
+        />
       </div>
     </div>
   )

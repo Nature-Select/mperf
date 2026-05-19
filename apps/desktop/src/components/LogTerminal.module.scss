@@ -99,7 +99,8 @@
   align-items: baseline;
   gap: 8px;
   padding: 1px 0;
-  word-break: break-word;
+  word-break: normal;
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
 

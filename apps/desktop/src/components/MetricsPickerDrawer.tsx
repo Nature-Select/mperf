@@ -232,6 +232,11 @@ function MetricRow({
       onClick={rowClick}
       onKeyDown={(e) => {
         if (disabled) return
+        // Only react when the row's wrapping div itself is focused —
+        // when focus is on the inner Checkbox, its native keydown
+        // already toggles via onChange, and our outer handler would
+        // double-toggle if we didn't short-circuit here.
+        if (e.target !== e.currentTarget) return
         if (e.key === ' ' || e.key === 'Enter') {
           e.preventDefault()
           onToggle()

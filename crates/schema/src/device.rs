@@ -62,10 +62,10 @@ impl DeviceField {
         }
     }
     pub fn some(label: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            value: Some(value.into()),
-        }
+        // Delegate to `new` so empty strings still collapse to None —
+        // otherwise a caller that passes `""` would surface a blank
+        // cell instead of the expected `unavailable` placeholder.
+        Self::new(label, Some(value.into()))
     }
     pub fn missing(label: impl Into<String>) -> Self {
         Self {
