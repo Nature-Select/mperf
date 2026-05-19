@@ -33,7 +33,7 @@ pub use apps::list_apps;
 #[allow(unused_imports)]
 pub use battery::BatterySampler;
 pub use cpu::{resolve_bundle_to_exec, CpuSampler};
-pub use devices::{device_info, list_devices, DeviceInfo};
+pub use devices::{device_info, list_devices};
 pub use graphics::GraphicsSampler;
 pub use launch::launch_app;
 pub use os_trace::{fetch_active_pids, OsTraceStream};

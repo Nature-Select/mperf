@@ -44,3 +44,43 @@ fn default_true() -> bool {
 fn default_transport() -> Transport {
     Transport::Usb
 }
+
+/// One row in the device-info panel — modelled on the PerfDog "Info /
+/// Value" two-column table. `value: None` is surfaced to the UI as
+/// "unavailable" so the field set stays stable across devices.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceField {
+    pub label: String,
+    pub value: Option<String>,
+}
+
+impl DeviceField {
+    pub fn new(label: impl Into<String>, value: Option<String>) -> Self {
+        Self {
+            label: label.into(),
+            value: value.filter(|s| !s.is_empty()),
+        }
+    }
+    pub fn some(label: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            value: Some(value.into()),
+        }
+    }
+    pub fn missing(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            value: None,
+        }
+    }
+}
+
+/// Device descriptor returned by the per-platform `device_info()` helpers.
+/// `fields` is ordered — the frontend renders it top-to-bottom verbatim,
+/// matching the PerfDog table layout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub platform: Platform,
+    pub fields: Vec<DeviceField>,
+}

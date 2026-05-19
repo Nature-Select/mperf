@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { Spin, Typography } from '@arco-design/web-react'
-import { DeviceInfoFull, Platform, Transport, getDeviceInfo } from '@/lib/ipc'
+import { Platform, Transport, getDeviceInfo } from '@/lib/ipc'
 import styles from './DeviceInfoPanel.module.scss'
 
 const { Text } = Typography
@@ -21,6 +21,8 @@ interface Props {
   /// false (DTX needs USB tunnel) — we annotate the Connection row.
   usable?: boolean
 }
+
+const UNAVAILABLE = 'unavailable'
 
 export function DeviceInfoPanel({ deviceId, platform, state, transport, usable }: Props) {
   const { data, isLoading, isError } = useQuery({
@@ -47,47 +49,38 @@ export function DeviceInfoPanel({ deviceId, platform, state, transport, usable }
     )
   }
 
-  const primary = buildPrimaryRows(data)
-  const connection = transport
+  const connectionLabel = transport
     ? `${transport === 'usb' ? 'USB' : 'Wi-Fi'}${usable === false ? ' · 不可采样' : ''}`
     : null
+
   return (
     <div className={styles.panel}>
-      <div className={styles.primary}>
-        {connection && <Field k="Connection" v={connection} />}
-        {primary.map(([k, v]) => (
-          <Field key={k} k={k} v={v} />
-        ))}
-      </div>
-      {data.extra.length > 0 && (
-        <div className={styles.extra}>
-          {data.extra.map(([k, v]) => (
-            <Field key={k} k={k} v={v} muted />
+      <table className={styles.table}>
+        <thead>
+          <tr>
+            <th className={styles.colInfo}>Info</th>
+            <th className={styles.colValue}>Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {connectionLabel && <Row label="Connection" value={connectionLabel} />}
+          {data.fields.map((f) => (
+            <Row key={f.label} label={f.label} value={f.value} />
           ))}
-        </div>
-      )}
+        </tbody>
+      </table>
     </div>
   )
 }
 
-function Field({ k, v, muted = false }: { k: string; v: string; muted?: boolean }) {
+function Row({ label, value }: { label: string; value: string | null }) {
+  const isMissing = value === null || value === undefined || value === ''
   return (
-    <div className={muted ? styles.fieldMuted : styles.field}>
-      <span className={styles.fieldLabel}>{k}</span>
-      <span className={styles.fieldValue}>{v}</span>
-    </div>
+    <tr>
+      <td className={styles.cellInfo}>{label}</td>
+      <td className={isMissing ? styles.cellValueMuted : styles.cellValue}>
+        {isMissing ? UNAVAILABLE : value}
+      </td>
+    </tr>
   )
-}
-
-function buildPrimaryRows(d: DeviceInfoFull): Array<[string, string]> {
-  const rows: Array<[string, string]> = []
-  if (d.model) rows.push(['Model', d.model])
-  if (d.manufacturer) rows.push(['Brand', d.manufacturer])
-  if (d.os_version) {
-    const label = d.platform === 'ios' ? 'iOS' : 'Android'
-    rows.push([label, d.os_version])
-  }
-  if (d.build) rows.push(['Build', d.build])
-  rows.push([d.platform === 'ios' ? 'UDID' : 'Serial', d.id])
-  return rows
 }

@@ -10,8 +10,7 @@ use idevice::{
     usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection},
     IdeviceService,
 };
-use mperf_schema::{Device, Platform, Transport};
-use serde::Serialize;
+use mperf_schema::{Device, DeviceField, DeviceInfo, Platform, Transport};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -88,7 +87,6 @@ pub async fn list_devices() -> Result<Vec<Device>> {
 /// Returns `Ok(None)` when the device is unpaired or lockdown otherwise
 /// refuses — we keep listing the device but show its UDID in the UI.
 async fn lookup_device_name(udid: &str, device_id: u32) -> Result<Option<String>> {
-    // Cache hit?
     {
         let cache = name_cache().lock().unwrap();
         if let Some((name, fetched_at)) = cache.get(udid) {
@@ -97,7 +95,6 @@ async fn lookup_device_name(udid: &str, device_id: u32) -> Result<Option<String>
             }
         }
     }
-    // Cache miss / stale — query and refresh.
     let name = match lookup_device_name_uncached(udid, device_id).await? {
         Some(n) => n,
         None => return Ok(None),
@@ -110,8 +107,6 @@ async fn lookup_device_name(udid: &str, device_id: u32) -> Result<Option<String>
 }
 
 async fn lookup_device_name_uncached(udid: &str, device_id: u32) -> Result<Option<String>> {
-    // Fresh usbmuxd connection per call — `UsbmuxdConnection` consumes itself
-    // when switching into a per-device session, so we can't share.
     let mut conn = UsbmuxdConnection::default().await?;
     let usbmuxd_dev = conn
         .get_devices()
@@ -138,105 +133,66 @@ async fn lookup_device_name_uncached(udid: &str, device_id: u32) -> Result<Optio
     Ok(value.as_string().map(|s| s.to_string()))
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct DeviceInfo {
-    pub id: String,
-    pub platform: String,
-    pub model: Option<String>,
-    pub manufacturer: Option<String>,
-    pub os_version: Option<String>,
-    pub build: Option<String>,
-    pub extra: Vec<(String, String)>,
-}
-
 pub async fn device_info(udid: &str) -> Result<DeviceInfo> {
-    // Lockdown queries each take ~150ms over USB. We open three separate
-    // lockdown clients concurrently and pipeline the queries; iOS muxes
-    // these fine and the total wall time drops from ~600ms to ~250ms.
-    let (main_res, battery_res, disk_res) = tokio::join!(
-        query_domain(udid, None),
-        query_domain(udid, Some("com.apple.mobile.battery")),
-        query_domain(udid, Some("com.apple.disk_usage")),
-    );
-    let dict = main_res?
+    let value = query_main(udid).await?;
+    let dict = value
         .into_dictionary()
         .ok_or_else(|| anyhow::anyhow!("lockdown response not a dictionary"))?;
-    let get_str = |k: &str| {
+    let get = |k: &str| {
         dict.get(k)
             .and_then(|v| v.as_string())
             .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
     };
-    // Decode the internal product identifier (e.g. "iPhone18,3") to the
-    // marketing name ("iPhone 17") when we know the mapping; fall back to
-    // the raw id otherwise.
-    let product_type = get_str("ProductType");
-    let model_decoded = product_type.as_deref().map(|pt| {
-        product_type_to_marketing_name(pt)
-            .map(String::from)
-            .unwrap_or_else(|| pt.to_string())
-    });
 
-    let mut info = DeviceInfo {
+    let device_name = get("DeviceName");
+    let product_type = get("ProductType");
+    let product_version = get("ProductVersion");
+    let build_version = get("BuildVersion");
+    let cpu_arch = get("CPUArchitecture");
+
+    // Marketing name (e.g. "iPhone 17") if we know the ProductType, else
+    // the raw ProductType code — same fallback the device listing uses.
+    let marketing = product_type
+        .as_deref()
+        .and_then(product_type_to_marketing_name)
+        .map(String::from);
+    let device_type = marketing
+        .clone()
+        .or_else(|| product_type.as_deref().map(|pt| family_from_product_type(pt).to_string()));
+
+    let os_combined = match (&product_version, &build_version) {
+        (Some(v), Some(b)) => Some(format!("{v} ({b})")),
+        (Some(v), None) => Some(v.clone()),
+        _ => None,
+    };
+
+    let spec = product_type.as_deref().and_then(chipset_for);
+    let cpu_type = spec.map(|s| s.cpu.to_string());
+    let cpu_core_num = spec.map(|s| s.cpu_cores.to_string());
+    let cpu_freq = spec.map(|s| format!("[0,{}]", s.cpu_max_mhz));
+    let gpu_type = spec.map(|s| s.gpu.to_string());
+
+    let fields = vec![
+        DeviceField::new("Device Name", device_name),
+        DeviceField::new("Device Type", device_type),
+        DeviceField::new("Product Type", product_type),
+        DeviceField::new("OS", os_combined),
+        DeviceField::new("CPU Type", cpu_type),
+        DeviceField::new("CPU Arch", cpu_arch),
+        DeviceField::new("CPU CoreNum", cpu_core_num),
+        DeviceField::new("CPU Freq", cpu_freq),
+        DeviceField::new("GPU Type", gpu_type),
+    ];
+
+    Ok(DeviceInfo {
         id: udid.to_string(),
-        platform: "ios".into(),
-        model: model_decoded,
-        manufacturer: Some("Apple".into()),
-        os_version: get_str("ProductVersion"),
-        build: get_str("BuildVersion"),
-        extra: Vec::new(),
-    };
-    // The user-set device name belongs in the extra section as "Name".
-    if let Some(name) = get_str("DeviceName") {
-        info.extra.push(("Name".to_string(), name));
-    }
-    // QA-relevant: battery, storage. Results were fetched in parallel
-    // above; here we just consume them.
-    if let Ok(battery_value) = battery_res {
-        if let Some(d) = battery_value.into_dictionary() {
-            if let Some(line) = format_ios_battery(&d) {
-                info.extra.push(("Battery".to_string(), line));
-            }
-        }
-    }
-    if let Ok(disk_value) = disk_res {
-        if let Some(d) = disk_value.into_dictionary() {
-            if let Some(line) = format_ios_disk(&d) {
-                info.extra.push(("Storage".to_string(), line));
-            }
-        }
-    }
-    // iOS keeps locale in the basic domain under `Locale`. Fall back to
-    // `Languages` for older firmwares.
-    if let Some(loc) = get_str("Locale").or_else(|| get_str("Languages")) {
-        if !loc.is_empty() {
-            info.extra.push(("Locale".to_string(), loc));
-        }
-    }
-
-    for (label, key) in [
-        ("Name", ""), // handled above already; placeholder to preserve ordering
-        ("Product Type", "ProductType"),
-        ("Hardware Model", "HardwareModel"),
-        ("CPU Architecture", "CPUArchitecture"),
-        ("Chip ID", "ChipID"),
-        ("WiFi Address", "WiFiAddress"),
-        ("Activation State", "ActivationState"),
-    ] {
-        if key.is_empty() {
-            continue;
-        }
-        if let Some(v) = get_str(key) {
-            if !v.is_empty() {
-                info.extra.push((label.to_string(), v));
-            }
-        }
-    }
-    Ok(info)
+        platform: Platform::Ios,
+        fields,
+    })
 }
 
-/// Open a fresh lockdown session and run a single get_value query.
-/// Spawning a new client per query is intentional — we want concurrency.
-async fn query_domain(udid: &str, domain: Option<&str>) -> Result<plist::Value> {
+async fn query_main(udid: &str) -> Result<plist::Value> {
     let mut conn = UsbmuxdConnection::default().await.context("usbmuxd")?;
     let dev = conn
         .get_devices()
@@ -249,76 +205,98 @@ async fn query_domain(udid: &str, domain: Option<&str>) -> Result<plist::Value> 
         .await
         .context("lockdown connect")?;
     let value = lockdown
-        .get_value(None, domain)
+        .get_value(None, None)
         .await
-        .with_context(|| format!("lockdown get_value(domain={domain:?})"))?;
+        .context("lockdown get_value(main)")?;
     Ok(value)
 }
 
-fn format_ios_battery(d: &plist::Dictionary) -> Option<String> {
-    let cap = d
-        .get("BatteryCurrentCapacity")
-        .and_then(|v| match v {
-            plist::Value::Integer(i) => i.as_signed().map(|x| x as i64),
-            plist::Value::Real(r) => Some(*r as i64),
-            _ => None,
-        });
-    let charging = d
-        .get("BatteryIsCharging")
-        .and_then(|v| v.as_boolean());
-    let external = d
-        .get("ExternalConnected")
-        .and_then(|v| v.as_boolean());
-    let cap = cap?;
-    let mut s = format!("{cap}%");
-    if charging.unwrap_or(false) {
-        s.push_str(" (charging)");
-    } else if external.unwrap_or(false) {
-        s.push_str(" (plugged · not charging)");
-    } else {
-        s.push_str(" (discharging)");
-    }
-    Some(s)
+/// "iPhone14,7" → "iPhone14" — the family prefix matches PerfDog's
+/// "Device Type" column when no marketing name is known. Falls back to
+/// the full code if there's no comma (shouldn't happen for real
+/// Apple ProductType strings, but be defensive).
+fn family_from_product_type(pt: &str) -> &str {
+    pt.split_once(',').map(|(family, _)| family).unwrap_or(pt)
 }
 
-fn format_ios_disk(d: &plist::Dictionary) -> Option<String> {
-    // Common keys: TotalDataCapacity, AmountDataAvailable.
-    // (TotalSystemCapacity covers OS partition; we focus on user storage.)
-    fn as_u64(v: Option<&plist::Value>) -> Option<u64> {
-        v.and_then(|v| match v {
-            plist::Value::Integer(i) => i.as_unsigned(),
-            plist::Value::Real(r) => Some(*r as u64),
-            _ => None,
-        })
-    }
-    let total = as_u64(d.get("TotalDataCapacity"))?;
-    let avail = as_u64(d.get("AmountDataAvailable")).unwrap_or(0);
-    let used = total.saturating_sub(avail);
-    Some(format!(
-        "{} / {} (free {})",
-        format_bytes_ios(used),
-        format_bytes_ios(total),
-        format_bytes_ios(avail)
-    ))
+/// Chipset spec sheet info indexed by Apple `ProductType`. iOS doesn't
+/// expose CPU/GPU spec at runtime (Apple keeps it private), so this is
+/// the same lookup-table approach PerfDog uses. Update when new devices
+/// ship.
+#[derive(Debug, Clone, Copy)]
+struct ChipsetSpec {
+    cpu: &'static str,
+    cpu_cores: u8,
+    /// Max P-core boost frequency, in MHz. Used for the PerfDog-style
+    /// "[0,3240]" CPU Freq display — the "0" matches PerfDog's convention
+    /// for "min unknown" (iOS doesn't expose live CPU frequency).
+    cpu_max_mhz: u32,
+    gpu: &'static str,
 }
 
-fn format_bytes_ios(bytes: u64) -> String {
-    let gb = bytes as f64 / 1024.0 / 1024.0 / 1024.0;
-    if gb >= 1.0 {
-        format!("{gb:.1} GB")
-    } else {
-        let mb = bytes as f64 / 1024.0 / 1024.0;
-        format!("{mb:.0} MB")
+fn chipset_for(pt: &str) -> Option<ChipsetSpec> {
+    // Naming convention: short marketing name ("Apple A15"), no "Bionic"
+    // suffix, to match PerfDog's display. GPU strings parenthesise the
+    // core count exactly like PerfDog.
+    macro_rules! spec {
+        ($cpu:expr, $cores:expr, $max:expr, $gpu:expr) => {
+            Some(ChipsetSpec { cpu: $cpu, cpu_cores: $cores, cpu_max_mhz: $max, gpu: $gpu })
+        };
+    }
+    match pt {
+        // A11 — iPhone 8 / 8 Plus / X
+        "iPhone10,1" | "iPhone10,2" | "iPhone10,3"
+        | "iPhone10,4" | "iPhone10,5" | "iPhone10,6" =>
+            spec!("Apple A11", 6, 2390, "Apple GPU (3-Core GPU)"),
+        // A12 — XS / XS Max / XR
+        "iPhone11,2" | "iPhone11,4" | "iPhone11,6" | "iPhone11,8" =>
+            spec!("Apple A12", 6, 2490, "Apple GPU (4-Core GPU)"),
+        // A13 — iPhone 11 series + SE 2
+        "iPhone12,1" | "iPhone12,3" | "iPhone12,5" | "iPhone12,8" =>
+            spec!("Apple A13", 6, 2650, "Apple GPU (4-Core GPU)"),
+        // A14 — iPhone 12 series
+        "iPhone13,1" | "iPhone13,2" | "iPhone13,3" | "iPhone13,4" =>
+            spec!("Apple A14", 6, 2990, "Apple GPU (4-Core GPU)"),
+        // A15 (4-core GPU) — iPhone 13 mini/13, SE 3
+        "iPhone14,4" | "iPhone14,5" | "iPhone14,6" =>
+            spec!("Apple A15", 6, 3230, "Apple GPU (4-Core GPU)"),
+        // A15 (5-core GPU) — iPhone 13 Pro/Pro Max, iPhone 14/14 Plus
+        "iPhone14,2" | "iPhone14,3" | "iPhone14,7" | "iPhone14,8" =>
+            spec!("Apple A15", 6, 3230, "Apple GPU (5-Core GPU)"),
+        // A16 — iPhone 14 Pro/Pro Max, iPhone 15/15 Plus
+        "iPhone15,2" | "iPhone15,3" | "iPhone15,4" | "iPhone15,5" =>
+            spec!("Apple A16", 6, 3460, "Apple GPU (5-Core GPU)"),
+        // A17 Pro — iPhone 15 Pro/Pro Max
+        "iPhone16,1" | "iPhone16,2" =>
+            spec!("Apple A17 Pro", 6, 3780, "Apple GPU (6-Core GPU)"),
+        // A18 — iPhone 16/16 Plus
+        "iPhone17,3" | "iPhone17,4" =>
+            spec!("Apple A18", 6, 4040, "Apple GPU (5-Core GPU)"),
+        // A18 (binned 4-core GPU) — iPhone 16e
+        "iPhone17,5" =>
+            spec!("Apple A18", 6, 4040, "Apple GPU (4-Core GPU)"),
+        // A18 Pro — iPhone 16 Pro/Pro Max
+        "iPhone17,1" | "iPhone17,2" =>
+            spec!("Apple A18 Pro", 6, 4040, "Apple GPU (6-Core GPU)"),
+        // A19 / A19 Pro — iPhone 17 series (2025). Max-boost figures
+        // are still preliminary; refine when Apple publishes formal
+        // spec sheets and Geekbench results stabilise.
+        "iPhone18,3" => spec!("Apple A19", 6, 4040, "Apple GPU (5-Core GPU)"),
+        "iPhone18,4" => spec!("Apple A19 Pro", 6, 4040, "Apple GPU (6-Core GPU)"),
+        "iPhone18,1" | "iPhone18,2" =>
+            spec!("Apple A19 Pro", 6, 4040, "Apple GPU (6-Core GPU)"),
+        _ => None,
     }
 }
 
 /// Translate an iOS `ProductType` identifier into the human-readable
-/// marketing name. Returns `None` for ids we don't know yet.
+/// marketing name. Returns `None` for ids we don't know yet — the caller
+/// falls back to the raw family prefix ("iPhone14" etc.).
 ///
 /// This table only needs to grow as new devices appear; the current set
 /// covers iPhones from iPhone 8 onwards (Apple's identifiers prior to that
 /// are unlikely to show up in modern testing).
-fn product_type_to_marketing_name(pt: &str) -> Option<&'static str> {
+pub(crate) fn product_type_to_marketing_name(pt: &str) -> Option<&'static str> {
     Some(match pt {
         // iPhone 8 / 8 Plus / X
         "iPhone10,1" | "iPhone10,4" => "iPhone 8",
@@ -367,4 +345,24 @@ fn product_type_to_marketing_name(pt: &str) -> Option<&'static str> {
         "iPhone18,4" => "iPhone Air",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chipset_lookup_iphone_14() {
+        let s = chipset_for("iPhone14,7").unwrap();
+        assert_eq!(s.cpu, "Apple A15");
+        assert_eq!(s.cpu_cores, 6);
+        assert!(s.gpu.contains("5-Core"));
+    }
+
+    #[test]
+    fn family_strip_works() {
+        assert_eq!(family_from_product_type("iPhone14,7"), "iPhone14");
+        assert_eq!(family_from_product_type("iPad11,1"), "iPad11");
+        assert_eq!(family_from_product_type("Watch7,1"), "Watch7");
+    }
 }
