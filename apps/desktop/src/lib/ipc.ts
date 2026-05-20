@@ -184,6 +184,35 @@ export interface SessionInfo {
   /// start. `null` on pre-v6 sessions; UI may surface "录制频率"
   /// info in the session header when present.
   sampling_intervals: Record<string, number> | null
+  /// User-triggered cold/hot startup measurements recorded during
+  /// this session. Either field may be absent if only one mode was
+  /// measured (or none).
+  startup_timings: { cold_ms?: number; hot_ms?: number } | null
+}
+
+export type StartupMode = 'cold' | 'hot'
+
+export interface StartupMeasurement {
+  total_ms: number
+  mode: StartupMode
+  /// Session id this measurement was persisted to. `null` when no
+  /// session was recording at measurement time — the value still
+  /// returns for live display but doesn't survive a reload.
+  persisted_to_session: number | null
+}
+
+export function measureStartup(
+  deviceId: string,
+  platform: Platform,
+  targetPkg: string,
+  mode: StartupMode,
+): Promise<StartupMeasurement> {
+  return invoke<StartupMeasurement>('measure_startup', {
+    deviceId,
+    platform,
+    targetPkg,
+    mode,
+  })
 }
 
 export interface SamplePoint {
