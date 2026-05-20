@@ -26,7 +26,21 @@ pub struct StartupTiming {
 /// measurement includes UIKit init, app delegate, scene attach, and
 /// the first runloop tick — everything the device does between the
 /// processcontrol launch RPC and its acknowledgement.
+///
+/// Same SpringBoard pre-step as hot: launching com.apple.springboard
+/// puts the home screen forward before we issue the kill+relaunch.
+/// Without it, `kill_existing=true` from a foreground target leaves
+/// the device on a black screen — DTX-initiated cold launches don't
+/// reliably trigger SpringBoard's "foreground the new app" path on
+/// iOS 16+, so the new process exists but isn't surfaced. With the
+/// pre-step, the relaunch follows the normal "user is on home,
+/// tapping an app" path and the UI shows up.
 pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTiming> {
+    if let Err(e) = launch_app_with_options(udid, "com.apple.springboard", false).await {
+        tracing::debug!(error = %e, "cold start: SpringBoard pre-launch failed; measuring direct kill+launch");
+    } else {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     measure(udid, bundle_id, true).await
 }
 
