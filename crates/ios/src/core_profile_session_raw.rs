@@ -327,17 +327,42 @@ impl CoreProfileSessionRaw {
                 tracing::info!(bytes_len = bytes.len(), "next_events: stackshot kcdata (skip)");
                 continue;
             }
+            // iOS 26 wraps EVERY coreprofile push in a
+            // DTKTraceTapMessage NSKeyedArchive container — the raw
+            // kdebug bytes live as an NSData field inside. (Older
+            // iOS apparently sent raw bytes per pymobiledevice3's
+            // docstring, but our device does not.) Unwrap and look
+            // for an NSData payload to parse as kd_buf records.
             if bytes.starts_with(b"bplist") {
-                // ns_keyed_archive doesn't understand the DTTapMessage
-                // class — it leaves us looking at raw $top / $objects
-                // / Uid pointers. Walk it ourselves so we can see
-                // the human strings the device is actually sending.
-                let strs = scan_bplist_strings(&bytes);
-                tracing::info!(
-                    bytes_len = bytes.len(),
-                    strings = ?strs,
-                    "next_events: bplist payload (skip)"
-                );
+                match extract_inner_data(&bytes) {
+                    Some(inner) if inner.len() >= 64 && inner.len() % 64 == 0 => {
+                        let events = parse_kd_buf_records(&inner);
+                        if !events.is_empty() {
+                            tracing::trace!(
+                                outer = bytes.len(),
+                                inner = inner.len(),
+                                n_events = events.len(),
+                                "next_events: unwrapped DTKTraceTapMessage → kdebug batch"
+                            );
+                            return Ok(events);
+                        }
+                    }
+                    Some(inner) => {
+                        tracing::info!(
+                            outer = bytes.len(),
+                            inner_len = inner.len(),
+                            "next_events: unwrapped NSData but not kd_buf-shaped (skip)"
+                        );
+                    }
+                    None => {
+                        let strs = scan_bplist_strings(&bytes);
+                        tracing::info!(
+                            bytes_len = bytes.len(),
+                            strings = ?strs,
+                            "next_events: bplist with no NSData (status ping, skip)"
+                        );
+                    }
+                }
                 continue;
             }
             let events = parse_kd_buf_records(&bytes);
@@ -469,6 +494,29 @@ fn parse_kd_buf_records(bytes: &[u8]) -> Vec<KdEvent> {
         offset += RECORD_SIZE;
     }
     events
+}
+
+/// Walk an NSKeyedArchive bplist and return the LARGEST NSData value
+/// found anywhere in its `$objects` pool. DTKTraceTapMessage embeds
+/// its kdebug-bytes payload as an NSData; finding the biggest Data
+/// is a robust heuristic against minor schema changes (key might be
+/// `k`, `ktrace`, something else) — kdebug pushes are kilobytes,
+/// any other Data in the archive is much smaller or absent.
+fn extract_inner_data(bytes: &[u8]) -> Option<Vec<u8>> {
+    let v = plist::Value::from_reader(std::io::Cursor::new(bytes)).ok()?;
+    let top = v.as_dictionary()?;
+    let objects = top.get("$objects")?.as_array()?;
+    let mut best: Option<&[u8]> = None;
+    for obj in objects {
+        if let Value::Data(b) = obj {
+            match best {
+                None => best = Some(b),
+                Some(prev) if b.len() > prev.len() => best = Some(b),
+                _ => {}
+            }
+        }
+    }
+    best.map(|b| b.to_vec())
 }
 
 /// Pull every String found anywhere in the bplist's value tree. Used
