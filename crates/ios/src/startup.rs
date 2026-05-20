@@ -1,21 +1,23 @@
 //! Cold / hot app-launch timing on iOS via Instruments processcontrol.
 //!
-//! Crude wall-clock approach: time the `launch_app` DTX call from the
-//! host side. processcontrol returns once the device has created the
-//! target process and dispatched its main entry — so the elapsed time
-//! roughly corresponds to "click icon → process start", excluding the
-//! ~1–2s DTX channel setup we always pay (that overhead is subtracted
-//! out: we measure only the time between channel-built and call-
-//! returned).
+//! Times just the `processcontrol.launchApp` RPC, NOT the full
+//! `launch_app_with_options` call — the ~1-2s of host-side DTX
+//! channel setup (CoreDeviceProxy / RSD / dtservicehub /
+//! RemoteServerClient / ProcessControlClient) is excluded so the
+//! number is comparable to Android's kernel-measured
+//! `am start -W TotalTime`, which also doesn't count host adb-shell
+//! overhead.
 //!
 //! Not as accurate as iOS Instruments' internal "App Launch" stage
 //! breakdown (which needs the DTX trace-events service we haven't
-//! implemented — see launch.rs comments). Returns a single
-//! `total_ms` good enough for relative comparisons.
+//! implemented — see launch.rs comments). The RPC time roughly
+//! corresponds to "device received launch request → process created
+//! + main entry dispatched"; iOS doesn't publish a "first frame
+//! rendered" event we can hook into the way Android's am does.
 
-use crate::launch::launch_app_with_options;
+use crate::launch::{launch_app_with_options, launch_app_with_options_timed};
 use anyhow::Result;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 pub struct StartupTiming {
@@ -88,10 +90,9 @@ pub async fn measure_hot_start(udid: &str, bundle_id: &str) -> Result<StartupTim
 }
 
 async fn measure(udid: &str, bundle_id: &str, kill_existing: bool) -> Result<StartupTiming> {
-    let t0 = Instant::now();
-    let _pid = launch_app_with_options(udid, bundle_id, kill_existing).await?;
-    let elapsed = t0.elapsed();
+    let (_pid, rpc_elapsed) =
+        launch_app_with_options_timed(udid, bundle_id, kill_existing).await?;
     Ok(StartupTiming {
-        total_ms: elapsed.as_millis() as u64,
+        total_ms: rpc_elapsed.as_millis() as u64,
     })
 }

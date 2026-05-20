@@ -43,6 +43,23 @@ pub async fn launch_app_with_options(
     bundle_id: &str,
     kill_existing: bool,
 ) -> Result<u64> {
+    launch_app_with_options_timed(udid, bundle_id, kill_existing)
+        .await
+        .map(|(pid, _)| pid)
+}
+
+/// Same as `launch_app_with_options` but also returns the elapsed
+/// time of the inner `processcontrol.launchApp` RPC — excluding the
+/// ~1-2s CoreDeviceProxy / RSD / DTX channel setup the host has to
+/// pay before the RPC can happen. This is the right number to surface
+/// for startup-timing measurements: it parallels Android's
+/// `am start -W TotalTime` (intent dispatch → first frame), where
+/// the host-side adb shell overhead isn't counted.
+pub async fn launch_app_with_options_timed(
+    udid: &str,
+    bundle_id: &str,
+    kill_existing: bool,
+) -> Result<(u64, std::time::Duration)> {
     let provider = connect::provider_for(udid).await.context("provider_for")?;
     let proxy = CoreDeviceProxy::connect(&*provider)
         .await
@@ -78,6 +95,13 @@ pub async fn launch_app_with_options(
     let mut pc = ProcessControlClient::new(&mut remote)
         .await
         .context("ProcessControlClient::new")?;
+
+    // Time JUST the launchApp RPC. Everything above this is host-side
+    // setup that has no analogue in Android's am-start measurement —
+    // including it would inflate iOS numbers by ~1-2s vs Android's
+    // kernel-reported TotalTime and make the two platforms look
+    // incomparable.
+    let rpc_start = std::time::Instant::now();
     let pid = pc
         .launch_app(
             bundle_id.to_string(),
@@ -88,5 +112,6 @@ pub async fn launch_app_with_options(
         )
         .await
         .with_context(|| format!("launch_app({bundle_id})"))?;
-    Ok(pid)
+    let rpc_elapsed = rpc_start.elapsed();
+    Ok((pid, rpc_elapsed))
 }
