@@ -19,7 +19,6 @@ use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 
 const MIN_INTERVAL_MS: u64 = 200;
-pub const DEFAULT_INTERVAL_MS: u64 = 1000;
 
 pub struct MemSampler {
     serial: String,

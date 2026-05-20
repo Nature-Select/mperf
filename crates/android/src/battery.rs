@@ -17,7 +17,6 @@ use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 
 const MIN_INTERVAL_MS: u64 = 500;
-pub const DEFAULT_INTERVAL_MS: u64 = 2000;
 
 pub struct BatterySampler {
     serial: String,

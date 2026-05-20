@@ -27,7 +27,6 @@ use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 
 const MIN_INTERVAL_MS: u64 = 200;
-pub const DEFAULT_INTERVAL_MS: u64 = 1000;
 
 /// Probe each candidate path with an individual `ls -1d` (semicolon-chained,
 /// no `for` loops or `$()` — Samsung toybox hangs on those). Each `ls`

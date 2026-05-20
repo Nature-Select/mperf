@@ -23,9 +23,6 @@ use tokio::time::{interval, MissedTickBehavior};
 /// load on adb than the resulting data is worth. The configurable
 /// `interval_ms` is clamped to this minimum on construction.
 const MIN_INTERVAL_MS: u64 = 200;
-/// Default cadence when the caller doesn't override. Matches the
-/// pre-configurable behaviour so unchanged call sites are unaffected.
-pub const DEFAULT_INTERVAL_MS: u64 = 1000;
 
 pub struct CpuSampler {
     serial: String,

@@ -20,7 +20,6 @@ use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 
 const MIN_INTERVAL_MS: u64 = 500;
-pub const DEFAULT_INTERVAL_MS: u64 = 3000;
 const DOMAIN: &str = "com.apple.mobile.battery";
 
 pub struct BatterySampler {
