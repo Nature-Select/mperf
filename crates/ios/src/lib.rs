@@ -43,3 +43,11 @@ pub use os_trace::{fetch_active_pids, OsTraceStream};
 pub use pid_resolver::{resolve_bundle_to_pids, BundleResolution};
 #[allow(unused_imports)]
 pub use syslog::SyslogStream;
+
+/// Re-exports for `cargo run --example` harnesses that exercise low-
+/// level DTX paths against a real device. Not part of the public API
+/// for desktop / consumers — `#[doc(hidden)]` keeps it out of docs.
+#[doc(hidden)]
+pub mod testing {
+    pub use crate::connect::provider_for;
+}
