@@ -13,6 +13,7 @@ mod apps;
 #[allow(dead_code)]
 mod battery;
 mod connect;
+mod core_profile_session_raw;
 mod cpu;
 mod devices;
 mod graphics;
