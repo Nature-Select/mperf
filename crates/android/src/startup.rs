@@ -38,10 +38,14 @@ pub async fn measure_cold_start(serial: &str, pkg: &str) -> Result<StartupTiming
     if !adb::is_safe_pkg_name(pkg) {
         anyhow::bail!("unsafe package name: {pkg}");
     }
+    let component = resolve_launcher_component(serial, pkg).await?;
     // Stop the app explicitly before measurement. Ignore failures
     // (already-stopped → exit non-zero on some toyboxes).
     let _ = adb::shell_raw(serial, &format!("am force-stop {pkg}")).await;
-    let cmd = format!("am start -W -S -n {pkg}/$(cmd package resolve-activity --brief {pkg} 2>/dev/null | tail -n1)");
+    let cmd = format!(
+        "am start -W -S -a android.intent.action.MAIN \
+         -c android.intent.category.LAUNCHER -n {component}"
+    );
     run_am_start(serial, &cmd).await
 }
 
@@ -53,8 +57,41 @@ pub async fn measure_hot_start(serial: &str, pkg: &str) -> Result<StartupTiming>
     if !adb::is_safe_pkg_name(pkg) {
         anyhow::bail!("unsafe package name: {pkg}");
     }
-    let cmd = format!("am start -W -n {pkg}/$(cmd package resolve-activity --brief {pkg} 2>/dev/null | tail -n1)");
+    let component = resolve_launcher_component(serial, pkg).await?;
+    let cmd = format!(
+        "am start -W -a android.intent.action.MAIN \
+         -c android.intent.category.LAUNCHER -n {component}"
+    );
     run_am_start(serial, &cmd).await
+}
+
+/// Resolve the package's launcher activity component (returned as the
+/// `pkg/.ActivityName` string `am start -n` expects).
+///
+/// `cmd package resolve-activity --brief` on Android 7+ prints the
+/// resolved component on a line by itself, but OEMs (Samsung in
+/// particular) prepend a verbose ResolveInfo summary that confuses
+/// naive `tail -n1` parsing. We grab the last line that actually
+/// looks like a component — has a `/` and starts with the package
+/// name. Two-step (resolve + start) instead of shell `$(…)` so the
+/// parsing happens in Rust where errors surface clearly.
+async fn resolve_launcher_component(serial: &str, pkg: &str) -> Result<String> {
+    let raw = adb::shell_raw(serial, &format!("cmd package resolve-activity --brief {pkg}"))
+        .await
+        .with_context(|| format!("resolve-activity {pkg}"))?;
+    let prefix = format!("{pkg}/");
+    let component = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| l.starts_with(&prefix) && l.contains('/'))
+        .last()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not find launcher component for {pkg} in resolve-activity output: {raw}"
+            )
+        })?
+        .to_string();
+    Ok(component)
 }
 
 async fn run_am_start(serial: &str, cmd: &str) -> Result<StartupTiming> {
