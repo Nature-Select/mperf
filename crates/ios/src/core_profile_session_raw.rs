@@ -395,7 +395,7 @@ impl CoreProfileSessionRaw {
             // for an NSData payload to parse as kd_buf records.
             if bytes.starts_with(b"bplist") {
                 match extract_inner_data(&bytes) {
-                    Some(inner) if inner.len() >= 64 => {
+                    Some(inner) if inner.len() >= 8 => {
                         // bm=1 streams add a variable-length preamble
                         // before the 64-byte kd_buf records (~46 bytes
                         // observed). Try parsing from the trailing

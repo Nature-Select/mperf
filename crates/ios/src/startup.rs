@@ -100,15 +100,25 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
             .map_err(|_| anyhow!("kdebug stream timed out waiting for first-frame event"))??;
         let batch_n = events.len();
         events_seen += batch_n as u64;
-        // Diagnostic: dump unique debug_ids in this batch so we can
-        // see what's actually arriving when the first-frame marker
-        // never matches.
-        if events_seen <= 5_000 {
+        if events_seen <= 50_000 {
             let mut classes: std::collections::BTreeSet<u8> =
                 std::collections::BTreeSet::new();
+            // Collect debug_ids of class 0x31 (UI / first-frame) and
+            // class 0x2B (app lifecycle) events. iOS 26 may use a
+            // different debug_id than py-ios-device's 0x31C00506 for
+            // first-frame — we want to find it empirically.
+            let mut class31_ids: Vec<String> = Vec::new();
+            let mut class2b_ids: Vec<String> = Vec::new();
+            let mut class1f_ids: Vec<String> = Vec::new();
             let mut has_target = false;
             for e in &events {
                 classes.insert(e.class_code());
+                match e.class_code() {
+                    0x31 => class31_ids.push(format!("{:#010x}", e.debug_id)),
+                    0x2b => class2b_ids.push(format!("{:#010x}", e.debug_id)),
+                    0x1f => class1f_ids.push(format!("{:#010x}", e.debug_id)),
+                    _ => {}
+                }
                 if e.debug_id == FIRST_FRAME_END_DEBUG_ID {
                     has_target = true;
                 }
@@ -118,6 +128,12 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
                 events_seen,
                 ?classes,
                 has_target,
+                class31_count = class31_ids.len(),
+                class2b_count = class2b_ids.len(),
+                class1f_count = class1f_ids.len(),
+                class31_ids = ?class31_ids,
+                class2b_ids = ?class2b_ids,
+                class1f_ids = ?class1f_ids,
                 "kdebug batch"
             );
         }
