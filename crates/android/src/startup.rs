@@ -12,6 +12,7 @@
 
 use crate::adb;
 use anyhow::{Context, Result};
+use std::time::Duration;
 
 /// `am start -W` output snippet we parse:
 /// ```text
@@ -49,10 +50,13 @@ pub async fn measure_cold_start(serial: &str, pkg: &str) -> Result<StartupTiming
     run_am_start(serial, &cmd).await
 }
 
-/// Hot start: app should be in background (or fully foregrounded —
-/// `am start` is idempotent in that case). No `-S`; we want the
-/// existing process reused so the measurement reflects UI re-attach,
-/// not cold init.
+/// Hot start: relaunch the app expecting the existing process to be
+/// reused. If the app is currently foreground, `am start` no-ops
+/// (returns "intent delivered to top-most instance" with TotalTime=0
+/// — useless), so we detect that case, send a HOME key to background
+/// the app, briefly wait for the home-screen transition, then re-fire
+/// the launch. The retried measurement reflects actual hot-start
+/// latency (UI re-attach + first frame).
 pub async fn measure_hot_start(serial: &str, pkg: &str) -> Result<StartupTiming> {
     if !adb::is_safe_pkg_name(pkg) {
         anyhow::bail!("unsafe package name: {pkg}");
@@ -62,7 +66,34 @@ pub async fn measure_hot_start(serial: &str, pkg: &str) -> Result<StartupTiming>
         "am start -W -a android.intent.action.MAIN \
          -c android.intent.category.LAUNCHER -n {component}"
     );
-    run_am_start(serial, &cmd).await
+    let raw = run_am_start_raw(serial, &cmd).await?;
+    if is_already_foreground(&raw) {
+        tracing::info!(pkg, "hot start: app already foreground, sending HOME and retrying");
+        // KEYCODE_HOME = 3. Best-effort — if it fails the second
+        // am start probably still no-ops, surfaced as the same error
+        // path below.
+        let _ = adb::shell_raw(serial, "input keyevent 3").await;
+        // 800ms is empirical: Samsung One UI's home transition can
+        // take 600-700ms (slower than AOSP's ~250ms), and firing
+        // `am start` mid-transition produces a broken `LaunchState:
+        // UNKNOWN (0)` reply with no TotalTime line. 800ms is safely
+        // past it on the test S9310; Pixel-class hardware just waits
+        // a bit longer than strictly necessary.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let raw2 = run_am_start_raw(serial, &cmd).await?;
+        return parse_total_time(&raw2)
+            .with_context(|| format!("could not find TotalTime after HOME retry: {raw2}"));
+    }
+    parse_total_time(&raw).with_context(|| format!("could not find TotalTime: {raw}"))
+}
+
+/// Detect the "already at top, no relaunch happened" signal in `am
+/// start -W` output. Two markers because OEMs differ: AOSP emits the
+/// Warning line, some Samsung builds skip the warning but still show
+/// `LaunchState: UNKNOWN (0)` + `TotalTime: 0`.
+fn is_already_foreground(raw: &str) -> bool {
+    raw.contains("Activity not started, intent has been delivered")
+        || raw.contains("LaunchState: UNKNOWN")
 }
 
 /// Resolve the package's launcher activity component (returned as the
@@ -95,11 +126,15 @@ async fn resolve_launcher_component(serial: &str, pkg: &str) -> Result<String> {
 }
 
 async fn run_am_start(serial: &str, cmd: &str) -> Result<StartupTiming> {
-    let raw = adb::shell_raw(serial, cmd)
-        .await
-        .with_context(|| format!("adb shell '{cmd}'"))?;
+    let raw = run_am_start_raw(serial, cmd).await?;
     parse_total_time(&raw)
         .with_context(|| format!("could not find TotalTime in `am start -W` output: {raw}"))
+}
+
+async fn run_am_start_raw(serial: &str, cmd: &str) -> Result<String> {
+    adb::shell_raw(serial, cmd)
+        .await
+        .with_context(|| format!("adb shell '{cmd}'"))
 }
 
 fn parse_total_time(raw: &str) -> Result<StartupTiming> {
