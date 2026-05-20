@@ -164,6 +164,10 @@ export function LiveView({
         selected.platform,
         targetPkg,
         selected.model,
+        // Snapshot the picker at recording start so the History view
+        // of this session always reflects "what the user was focused
+        // on at the time", independent of later picker changes.
+        Array.from(metricsSelection),
       )
       setActiveSessionId(sid)
       setNotice({ kind: 'success', text: `Session #${sid} recording`, auto: true })

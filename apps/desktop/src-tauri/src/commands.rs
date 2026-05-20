@@ -74,6 +74,11 @@ pub async fn list_apps(
     }
 }
 
+/// Starts a recording. `selected_metrics` is the user's metrics-picker
+/// selection at the moment Start was clicked — persisted alongside the
+/// session so its History view filters charts to what the user was
+/// focused on at recording time. Empty/missing → stored as NULL and
+/// History falls back to "show every captured metric".
 #[tauri::command]
 pub async fn start_session(
     state: State<'_, AppState>,
@@ -82,6 +87,7 @@ pub async fn start_session(
     platform: Platform,
     device_model: Option<String>,
     target_pkg: String,
+    selected_metrics: Option<Vec<String>>,
 ) -> Result<i64, String> {
     // PerfDog-style: app selection is mandatory. Frontend disables Start
     // until both device + app are picked; this is the backend guard.
@@ -89,7 +95,17 @@ pub async fn start_session(
     if target_pkg.is_empty() {
         return Err("a target app must be selected before recording".into());
     }
-    session::start_recording(&state, &app, device_id, platform, device_model, target_pkg).await
+    let selected_metrics = selected_metrics.filter(|v| !v.is_empty());
+    session::start_recording(
+        &state,
+        &app,
+        device_id,
+        platform,
+        device_model,
+        target_pkg,
+        selected_metrics,
+    )
+    .await
 }
 
 #[tauri::command]

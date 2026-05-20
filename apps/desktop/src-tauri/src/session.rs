@@ -88,6 +88,7 @@ pub async fn start_recording(
     platform: Platform,
     device_model: Option<String>,
     target_pkg: String,
+    selected_metrics: Option<Vec<String>>,
 ) -> Result<i64, String> {
     tracing::info!(
         device_id = %device_id,
@@ -133,6 +134,7 @@ pub async fn start_recording(
             device_model,
             app_bundle_id: Some(target_pkg.clone()),
             meta_json: None,
+            selected_metrics,
         })
         .await
         .map_err(|e| e.to_string())?;

@@ -26,7 +26,6 @@ import {
 } from '@/lib/ipc'
 import { formatDateTime, formatDuration } from '@/lib/format'
 import { MarkerControls } from '@/lib/markers'
-import { useMetricsSelection } from '@/lib/useMetricsSelection'
 import { StaticCpuChart } from './StaticCpuChart'
 import { StaticPerCoreChart } from './StaticPerCoreChart'
 import { StaticFpsChart } from './StaticFpsChart'
@@ -252,13 +251,19 @@ function EmptyDetail() {
 
 function SessionDetail({ session }: { session: SessionInfo }) {
   const qc = useQueryClient()
-  // Mirrors LiveView's chart gating — we still capture every metric on
-  // the backend (no schema or sampler changes), so flipping a metric
-  // back on in the picker re-surfaces its chart here without needing
-  // to re-record. Trades a small UX cost (you have to remember what
-  // you toggled off) for retroactive data access, which is the right
-  // default for performance debugging.
-  const { selected: metricsSelection } = useMetricsSelection()
+  // Gate charts by the session's own recording-time snapshot, NOT the
+  // live picker — the picker expresses "what I want to see right now",
+  // which is the wrong question to ask about a session recorded weeks
+  // ago. Legacy sessions (`selected_metrics === null`) show every
+  // metric they captured.
+  //
+  // `showAll` is the escape hatch: backend captures every metric
+  // regardless of selection, so if a user later wishes they hadn't
+  // unticked Memory at recording time, flipping this surfaces the data
+  // that was always in the DB. Per-detail-view state — not persisted.
+  const [showAll, setShowAll] = useState(false)
+  const snapshot = session.selected_metrics
+  const shows = (id: string) => showAll || snapshot === null || snapshot.includes(id)
   const { data: total, isLoading: lt } = useQuery<SamplePoint[]>({
     queryKey: ['samples', session.id, 'cpu_total_pct'],
     queryFn: () => getSessionSamples(session.id, 'cpu_total_pct'),
@@ -393,17 +398,27 @@ function SessionDetail({ session }: { session: SessionInfo }) {
         <span>{formatDuration(duration)}</span>
         <span>·</span>
         <span>{total?.length ?? 0} samples</span>
+        {snapshot !== null && (
+          <>
+            <span>·</span>
+            <ShowAllToggle
+              value={showAll}
+              hiddenCount={hiddenCount(snapshot)}
+              onChange={setShowAll}
+            />
+          </>
+        )}
       </div>
       {/*
         Chart order matches LiveView's picker-driven order
         (Frame → CPU Usage → CPU Core → Memory → GPU → Temperature) so
         scrolling Live and History feels like the same list. Each card
-        is gated by BOTH (a) the user's current picker selection and
-        (b) whether the session actually has data for this metric —
-        toggling a metric back on in the picker resurfaces its chart
-        without needing to re-record.
+        is gated by `shows(id)` — true when (a) `showAll` escape hatch
+        is on, (b) the session predates the snapshot column, OR (c) the
+        recording-time snapshot includes this metric — AND the session
+        actually has data for it.
       */}
-      {metricsSelection.has('frame') && (fps ?? []).length > 0 && (
+      {shows('frame') && (fps ?? []).length > 0 && (
         <StaticFpsChart
           fpsPoints={fps ?? []}
           smallJankTotal={Math.round(smallJankTotal)}
@@ -415,7 +430,7 @@ function SessionDetail({ session }: { session: SessionInfo }) {
           wallStartMs={session.wall_start_ms}
         />
       )}
-      {metricsSelection.has('cpu_usage') &&
+      {shows('cpu_usage') &&
         ((total ?? []).length > 0 || (appCpu ?? []).length > 0) && (
           <StaticCpuChart
             points={total ?? []}
@@ -424,21 +439,21 @@ function SessionDetail({ session }: { session: SessionInfo }) {
             wallStartMs={session.wall_start_ms}
           />
         )}
-      {metricsSelection.has('cpu_core') && (cores ?? []).length > 0 && (
+      {shows('cpu_core') && (cores ?? []).length > 0 && (
         <StaticPerCoreChart
           rows={cores ?? []}
           markers={markerControls}
           wallStartMs={session.wall_start_ms}
         />
       )}
-      {metricsSelection.has('memory') && (pss ?? []).length > 0 && (
+      {shows('memory') && (pss ?? []).length > 0 && (
         <StaticMemoryChart
           pssPoints={pss ?? []}
           markers={markerControls}
           wallStartMs={session.wall_start_ms}
         />
       )}
-      {metricsSelection.has('gpu') &&
+      {shows('gpu') &&
         ((gpuDevice ?? []).length > 0 ||
           (gpuRenderer ?? []).length > 0 ||
           (gpuTiler ?? []).length > 0) && (
@@ -450,7 +465,7 @@ function SessionDetail({ session }: { session: SessionInfo }) {
             wallStartMs={session.wall_start_ms}
           />
         )}
-      {metricsSelection.has('temperature') &&
+      {shows('temperature') &&
         ((temps ?? []).length > 0 || (batteryTemps ?? []).length > 0) && (
           <StaticTemperatureChart
             cpuPoints={temps ?? []}
@@ -460,5 +475,55 @@ function SessionDetail({ session }: { session: SessionInfo }) {
           />
         )}
     </div>
+  )
+}
+
+/// Tally of catalog ids the snapshot omitted — used to label the
+/// escape-hatch toggle ("当时未勾选: N 项") so the user knows what
+/// they're about to surface. Order: count every catalog metric that
+/// (a) has chart support and (b) isn't in the snapshot.
+const CHART_BACKED_METRICS = ['frame', 'cpu_usage', 'cpu_core', 'memory', 'gpu', 'temperature']
+function hiddenCount(snapshot: string[]): number {
+  let n = 0
+  for (const id of CHART_BACKED_METRICS) if (!snapshot.includes(id)) n += 1
+  return n
+}
+
+function ShowAllToggle({
+  value,
+  hiddenCount,
+  onChange,
+}: {
+  value: boolean
+  hiddenCount: number
+  onChange: (v: boolean) => void
+}) {
+  // Hide the toggle entirely when nothing is gated — no point showing
+  // an escape hatch if the recording-time snapshot already covers
+  // every chart-backed metric.
+  if (hiddenCount === 0 && !value) return null
+  return (
+    <label
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+        cursor: 'pointer',
+        userSelect: 'none',
+        color: 'var(--color-text-3)',
+      }}
+      title="当时录制选择的指标 vs 这个 session 实际录到的所有指标"
+    >
+      <input
+        type="checkbox"
+        checked={value}
+        onChange={(e) => onChange(e.target.checked)}
+        style={{ margin: 0 }}
+      />
+      <span>
+        全部展示
+        {!value && hiddenCount > 0 ? `（含 ${hiddenCount} 项当时未勾选）` : ''}
+      </span>
+    </label>
   )
 }
