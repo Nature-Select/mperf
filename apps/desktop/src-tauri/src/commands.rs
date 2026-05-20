@@ -195,7 +195,7 @@ pub async fn start_session(
     target_pkg: String,
     selected_metrics: Option<Vec<String>>,
     sampling_intervals: Option<std::collections::HashMap<String, u64>>,
-) -> Result<i64, String> {
+) -> Result<session::StartSessionResponse, String> {
     // PerfDog-style: app selection is mandatory. Frontend disables Start
     // until both device + app are picked; this is the backend guard.
     let target_pkg = target_pkg.trim().to_string();

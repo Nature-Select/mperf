@@ -108,6 +108,15 @@ export function listDevices(): Promise<Device[]> {
   return invoke<Device[]>('list_devices')
 }
 
+export interface StartSessionResponse {
+  session_id: number
+  /// Present only when `selected_metrics` included `"startup_timing"`
+  /// AND the auto-measurement succeeded. UI uses this to populate
+  /// the ScreenTab startup row immediately on Start — no need to
+  /// click "测试" manually.
+  startup?: { mode: StartupMode; total_ms: number }
+}
+
 export function startSession(
   deviceId: string,
   platform: Platform,
@@ -124,8 +133,8 @@ export function startSession(
   /// which case the sampler runs at the fastest requested rate.
   /// `undefined` ⇒ samplers use their hardcoded defaults.
   samplingIntervals?: Record<string, number>,
-): Promise<number> {
-  return invoke<number>('start_session', {
+): Promise<StartSessionResponse> {
+  return invoke<StartSessionResponse>('start_session', {
     deviceId,
     platform,
     deviceModel,

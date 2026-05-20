@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button, Message, Tooltip } from '@arco-design/web-react'
 import { Info, Play } from 'lucide-react'
 import { Platform, measureStartup, type StartupMode } from '@/lib/ipc'
@@ -16,6 +16,11 @@ interface Props {
   deviceId: string | null
   platform: Platform | null
   targetPkg: string | null
+  /// Forwarded from LiveView's `startSession` response — the launch
+  /// that just happened got auto-measured (mode detected from "is the
+  /// app already running"). Each new value populates the matching
+  /// row so the user doesn't need to click "测试" to see the data.
+  autoStartup: { mode: StartupMode; total_ms: number } | null
 }
 
 /// Top strip above the chart list — mirrors PerfDog's "SceneTab".
@@ -35,6 +40,7 @@ export function ScreenTab({
   deviceId,
   platform,
   targetPkg,
+  autoStartup,
 }: Props) {
   if (!screenshotOn && !startupTimingOn) return null
   return (
@@ -47,7 +53,12 @@ export function ScreenTab({
         </div>
       )}
       {startupTimingOn && (
-        <StartupSection deviceId={deviceId} platform={platform} targetPkg={targetPkg} />
+        <StartupSection
+          deviceId={deviceId}
+          platform={platform}
+          targetPkg={targetPkg}
+          autoStartup={autoStartup}
+        />
       )}
     </div>
   )
@@ -57,14 +68,25 @@ function StartupSection({
   deviceId,
   platform,
   targetPkg,
+  autoStartup,
 }: {
   deviceId: string | null
   platform: Platform | null
   targetPkg: string | null
+  autoStartup: { mode: StartupMode; total_ms: number } | null
 }) {
   const [coldMs, setColdMs] = useState<number | null>(null)
   const [hotMs, setHotMs] = useState<number | null>(null)
   const [busy, setBusy] = useState<StartupMode | null>(null)
+
+  // Mirror each new auto-measurement (from start_session response)
+  // into the matching row. Reference equality on `autoStartup` is
+  // enough — LiveView creates a fresh object per Start.
+  useEffect(() => {
+    if (!autoStartup) return
+    if (autoStartup.mode === 'cold') setColdMs(autoStartup.total_ms)
+    else setHotMs(autoStartup.total_ms)
+  }, [autoStartup])
 
   const canMeasure = !!deviceId && !!platform && !!targetPkg && busy === null
   const disabledReason = !deviceId

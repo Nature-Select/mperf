@@ -65,6 +65,12 @@ export function LiveView({
   // CustomEvent, so this hook stays in sync without prop drilling.
   const { selected: metricsSelection } = useMetricsSelection()
   const { map: metricFrequencies } = useMetricFrequencies()
+  // Populated by the auto-measurement that runs inside `start_session`
+  // when the user has `startup_timing` selected — flows from the IPC
+  // response into ScreenTab so the cold/hot row shows the result
+  // without the user clicking "测试" first.
+  const [autoStartup, setAutoStartup] =
+    useState<{ mode: 'cold' | 'hot'; total_ms: number } | null>(null)
   const { data, isLoading } = useQuery({
     queryKey: ['devices'],
     queryFn: listDevices,
@@ -161,7 +167,7 @@ export function LiveView({
     setNotice(null)
     setMarkers([])
     try {
-      const sid = await startSession(
+      const result = await startSession(
         selected.id,
         selected.platform,
         targetPkg,
@@ -175,8 +181,18 @@ export function LiveView({
         // History view shows what was actually captured.
         snapshotEffectiveFrequencies(metricFrequencies),
       )
-      setActiveSessionId(sid)
-      setNotice({ kind: 'success', text: `Session #${sid} recording`, auto: true })
+      setActiveSessionId(result.session_id)
+      if (result.startup) {
+        setAutoStartup(result.startup)
+      }
+      const startupNote = result.startup
+        ? ` · ${result.startup.mode === 'cold' ? '冷' : '热'}启动 ${result.startup.total_ms}ms`
+        : ''
+      setNotice({
+        kind: 'success',
+        text: `Session #${result.session_id} recording${startupNote}`,
+        auto: true,
+      })
     } catch (e) {
       setNotice({ kind: 'error', text: String(e) })
     }
@@ -670,6 +686,7 @@ export function LiveView({
               deviceId={selected.id}
               platform={selected.platform}
               targetPkg={targetPkg || null}
+              autoStartup={autoStartup}
             />
             {/*
               Each chart card is gated by its metrics-picker id and
