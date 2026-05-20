@@ -226,13 +226,36 @@ impl CoreProfileSessionRaw {
     async fn send_set_config(&mut self) -> Result<()> {
         let ch = self.coreprofile_channel;
         let mut tc_entry = Dictionary::new();
-        // kdf2 = [0xFFFFFFFF] = "all kdebug classes". pymobiledevice3
-        // sends this as a Python set (NSSet); we send Array. Device
-        // appears to accept either — if not, we'll see no events in
-        // the 15s window and know to dig further.
+        // kdf2 is a typefilter — each entry is `(class << 24) |
+        // (subclass << 16)`, matching every kdebug event with that
+        // class+subclass prefix. The sentinel `{0xFFFFFFFF}` that
+        // pymobiledevice3 uses as a "match everything" hint is
+        // interpreted by the device as class 0xFF / subclass 0xFF —
+        // which matches no real events; you get one pre-filter
+        // ring-buffer dump and then silence.
+        //
+        // This is py-ios-device's app_lifecycle.py allow-list:
+        // covers Dyld (0x1F/{05,07,08}), early init (0x01/...),
+        // image loading (0x04/0x08, 0x07/0x00), AppKit (0x2B/0xD8),
+        // UIKit (0x2B/0x87), Dyld-modern (0x2B/0xDC), Initial Frame
+        // Rendering (0x31/0xC0). The non-obvious ones (0x21/0x13,
+        // 0x2D/0xFF) are kept for completeness — they show up in
+        // py-ios-device's traces and removing them risks losing
+        // ordering context we may want for phase breakdown later.
+        let kdf2_filter: &[u32] = &[
+            0x2BD80000, 0x01250000, 0x04080000, 0x31C00000, 0x2BDC0000,
+            0x21130000, 0x2B870000, 0x1F070000, 0x07000000, 0x01300000,
+            0x010C0000, 0x01050000, 0x01090000, 0x2DFF0000, 0x1F080000,
+            0x01400000, 0x1F050000,
+        ];
         tc_entry.insert(
             "kdf2".into(),
-            Value::Array(vec![Value::Integer((0xFFFFFFFFu32 as i64).into())]),
+            Value::Array(
+                kdf2_filter
+                    .iter()
+                    .map(|&n| Value::Integer((n as i64).into()))
+                    .collect(),
+            ),
         );
         tc_entry.insert("csd".into(), Value::Integer(128i64.into()));
         tc_entry.insert("tk".into(), Value::Integer(3i64.into()));
