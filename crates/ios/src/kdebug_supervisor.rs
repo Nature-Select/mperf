@@ -136,21 +136,52 @@ async fn run_drain_task(
 ) {
     let mut healthy_events_seen = false;
     let mut payloads_seen: u64 = 0;
+    let mut empty_acks: u64 = 0;
+    let mut kd_batches: u64 = 0;
+    let mut total_events_in: u64 = 0;
+    let mut total_events_fwd: u64 = 0;
+    let mut last_heartbeat = std::time::Instant::now();
     tracing::info!("kdebug supervisor: drain task starting");
     loop {
-        let payload = match session.next_payload().await {
-            Ok(p) => p,
-            Err(e) => {
+        // Periodic heartbeat — wraps next_payload in a 2s timeout so
+        // we see logs even when iOS goes completely silent.
+        if last_heartbeat.elapsed() >= Duration::from_secs(2) {
+            tracing::info!(
+                payloads_seen,
+                kd_batches,
+                empty_acks,
+                total_events_in,
+                total_events_fwd,
+                subscribers = tx.receiver_count(),
+                "kdebug supervisor: heartbeat"
+            );
+            last_heartbeat = std::time::Instant::now();
+        }
+        let payload = match tokio::time::timeout(
+            Duration::from_secs(2),
+            session.next_payload(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
                 let msg = format!("drain stream error: {e}");
                 tracing::warn!(payloads_seen, error = %e, "kdebug supervisor: drain task exiting");
                 let mut guard = state.lock().await;
                 guard.last_error = Some(msg);
                 return;
             }
+            Err(_) => {
+                // 2s no payload — log and loop (heartbeat block above
+                // will print stats next iteration).
+                continue;
+            }
         };
         payloads_seen += 1;
         match payload {
             RawPayload::KdEvents(events) => {
+                kd_batches += 1;
+                total_events_in += events.len() as u64;
                 if events.is_empty() {
                     continue;
                 }
@@ -163,21 +194,34 @@ async fn run_drain_task(
                     healthy_events_seen = true;
                 }
                 // Filter to launch-relevant classes BEFORE broadcasting.
-                // Without this, ~95% of events are kernel noise that
-                // saturates the channel and starves consumers of the
-                // 0x2B events they actually need.
                 let mut forwarded = 0usize;
+                let mut by_class: [u32; 4] = [0; 4]; // 0x07, 0x1f, 0x2b, 0x31
                 for ev in events {
-                    if !is_launch_relevant_class(ev.class_code()) {
+                    let class = ev.class_code();
+                    if !is_launch_relevant_class(class) {
                         continue;
                     }
-                    // `send` errors only when there are zero
-                    // subscribers (idle between measurements) — drop.
+                    match class {
+                        0x07 => by_class[0] += 1,
+                        0x1f => by_class[1] += 1,
+                        0x2b => by_class[2] += 1,
+                        0x31 => by_class[3] += 1,
+                        _ => {}
+                    }
                     let _ = tx.send(ev);
                     forwarded += 1;
                 }
+                total_events_fwd += forwarded as u64;
                 if forwarded > 0 {
-                    tracing::trace!(forwarded, "kdebug supervisor: forwarded batch");
+                    tracing::info!(
+                        forwarded,
+                        c07 = by_class[0],
+                        c1f = by_class[1],
+                        c2b = by_class[2],
+                        c31 = by_class[3],
+                        subscribers = tx.receiver_count(),
+                        "kdebug supervisor: forwarded batch"
+                    );
                 }
             }
             RawPayload::StatusNotice { strings } => {
@@ -201,9 +245,10 @@ async fn run_drain_task(
                 tracing::info!(%detail, "kdebug supervisor: mid-session status notice (ignoring)");
             }
             RawPayload::Stackshot { bytes_len } => {
-                tracing::debug!(bytes_len, "kdebug supervisor: stackshot (drop)");
+                tracing::info!(bytes_len, "kdebug supervisor: stackshot (drop)");
             }
             RawPayload::EmptyAck { bytes_len } => {
+                empty_acks += 1;
                 tracing::trace!(bytes_len, "kdebug supervisor: empty ack (drop)");
             }
             RawPayload::Unknown { first8, bytes_len } => {
