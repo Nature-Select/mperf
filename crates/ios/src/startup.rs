@@ -1,98 +1,194 @@
 //! Cold / hot app-launch timing on iOS via Instruments processcontrol.
 //!
-//! Times just the `processcontrol.launchApp` RPC, NOT the full
-//! `launch_app_with_options` call — the ~1-2s of host-side DTX
-//! channel setup (CoreDeviceProxy / RSD / dtservicehub /
-//! RemoteServerClient / ProcessControlClient) is excluded so the
-//! number is comparable to Android's kernel-measured
-//! `am start -W TotalTime`, which also doesn't count host adb-shell
-//! overhead.
+//! Cold start: times `processcontrol.launchApp` RPC + waits for the
+//! launched PID to appear in a sysmontap sample stream — a first-
+//! activity proxy that's closer to Android's "first frame rendered"
+//! semantics than the bare RPC return alone.
 //!
-//! Not as accurate as iOS Instruments' internal "App Launch" stage
-//! breakdown (which needs the DTX trace-events service we haven't
-//! implemented — see launch.rs comments). The RPC time roughly
-//! corresponds to "device received launch request → process created
-//! + main entry dispatched"; iOS doesn't publish a "first frame
-//! rendered" event we can hook into the way Android's am does.
+//! Hot start: times just the launchApp RPC. The sysmontap proxy
+//! doesn't help here because the target's PID is already in the
+//! sample stream from before the launch (the process never died, we
+//! just resumed it from background) — so "first sample with target
+//! PID" arrives immediately and tells us nothing about UI re-attach.
+//!
+//! Foreground handling: same SpringBoard pre-step as the Android
+//! HOME-key trick. Without it, both cold (kill_existing=true) and
+//! hot (kill_existing=false) on a foreground target can leave the
+//! device on a black screen because DTX-initiated launches aren't
+//! always treated as user-foreground intents by SpringBoard.
+//!
+//! Phase breakdown (PerfDog-iOS-style "didFinishLaunching 80.99ms"
+//! waterfall) is deferred — that needs a custom DTX trace-events
+//! client we haven't implemented.
 
+use crate::connect;
 use crate::launch::{launch_app_with_options, launch_app_with_options_timed};
-use anyhow::Result;
-use std::time::Duration;
+use crate::sysmontap_raw::{SysmontapConfig, SysmontapRaw};
+use anyhow::{anyhow, Context, Result};
+use idevice::{
+    core_device_proxy::CoreDeviceProxy,
+    dvt::{device_info::DeviceInfoClient, remote_server::RemoteServerClient},
+    rsd::RsdHandshake,
+    IdeviceService, ReadWrite,
+};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub struct StartupTiming {
     pub total_ms: u64,
 }
 
-/// Cold start: `kill_existing=true` forces a fresh process. The
-/// measurement includes UIKit init, app delegate, scene attach, and
-/// the first runloop tick — everything the device does between the
-/// processcontrol launch RPC and its acknowledgement.
+/// Cold start: kill any existing process and time the relaunch.
 ///
-/// Same SpringBoard pre-step as hot: launching com.apple.springboard
-/// puts the home screen forward before we issue the kill+relaunch.
-/// Without it, `kill_existing=true` from a foreground target leaves
-/// the device on a black screen — DTX-initiated cold launches don't
-/// reliably trigger SpringBoard's "foreground the new app" path on
-/// iOS 16+, so the new process exists but isn't surfaced. With the
-/// pre-step, the relaunch follows the normal "user is on home,
-/// tapping an app" path and the UI shows up.
+/// 1. Launch SpringBoard (best-effort, to put the home screen
+///    forward so the relaunch is routed as a user-foreground intent
+///    by SpringBoard — fixes "black screen after cold start" on
+///    foreground targets).
+/// 2. Open a sysmontap session and start streaming process samples
+///    (untimed setup overhead, ~2s).
+/// 3. Launch the target via processcontrol with `kill_existing=true`
+///    on a separate DTX session, timing only the inner RPC.
+/// 4. Wait for a sysmontap sample whose `processes` Dict contains
+///    the new PID — proxy for "app is running and emitting metrics",
+///    closer to first-frame than the bare RPC return.
+/// 5. Report `rpc_ms + wait_ms` as total launch latency.
 pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTiming> {
     if let Err(e) = launch_app_with_options(udid, "com.apple.springboard", false).await {
-        tracing::debug!(error = %e, "cold start: SpringBoard pre-launch failed; measuring direct kill+launch");
+        tracing::debug!(error = %e, "cold start: SpringBoard pre-launch failed; continuing");
     } else {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    measure(udid, bundle_id, true).await
+
+    // Setup sysmontap session on its own DTX channel (separate from
+    // the one launch_app_with_options_timed builds internally — we
+    // can't share `remote` because SysmontapRaw and ProcessControlClient
+    // each take `&mut RemoteServerClient` and the borrows would
+    // conflict). ~1-2s setup, not counted in the measurement.
+    let mut remote = build_dtx_remote(udid).await?;
+
+    // proc_attrs is required by sysmontap's set_config even though we
+    // don't decode any per-process values — we only key on PID, which
+    // is the processes Dict key itself.
+    let proc_attrs = {
+        let mut info = DeviceInfoClient::new(&mut remote)
+            .await
+            .context("DeviceInfoClient::new")?;
+        info.sysmon_process_attributes()
+            .await
+            .context("sysmon_process_attributes")?
+    };
+
+    let mut sysmontap = SysmontapRaw::new(&mut remote)
+        .await
+        .context("SysmontapRaw::new")?;
+    sysmontap
+        .set_config(&SysmontapConfig {
+            interval_ms: 300,
+            process_attributes: proc_attrs,
+            system_attributes: vec![],
+        })
+        .await
+        .context("sysmontap set_config")?;
+    sysmontap.start().await.context("sysmontap.start")?;
+
+    // Drain one sample so the next one strictly reflects post-launch
+    // state. Bounded — a silently-dropped first sample shouldn't
+    // hang the measurement.
+    let _ = tokio::time::timeout(Duration::from_millis(1500), sysmontap.next_sample()).await;
+
+    // Launch via a separate DTX session. launch_app_with_options_timed
+    // returns only the inner RPC duration — its own setup overhead is
+    // excluded from the number we report.
+    let (pid, rpc_elapsed) = launch_app_with_options_timed(udid, bundle_id, true).await?;
+
+    // Hand-off: launch_app_with_options_timed timed only the inner
+    // RPC, then returns. Microseconds between return and our
+    // wait_start, so wait_start ≈ "moment device acknowledged the
+    // launch RPC". Total = RPC time + time until sysmontap sees the
+    // new PID active = "RPC start → first activity" measurement,
+    // excluding both DTX setups.
+    let pid_key = pid.to_string();
+    let wait_start = Instant::now();
+    let deadline = wait_start + Duration::from_secs(8);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "sysmontap proxy timed out waiting for PID {pid} (8s); device may be \
+                 throttled or sysmontap stalled"
+            );
+        }
+        let sample = tokio::time::timeout(remaining, sysmontap.next_sample())
+            .await
+            .map_err(|_| anyhow!("sysmontap next_sample timed out"))?
+            .map_err(|e| anyhow!("sysmontap next_sample error: {e}"))?;
+        if let Some(processes) = sample.processes {
+            if processes.contains_key(&pid_key) {
+                break;
+            }
+        }
+    }
+    let wait_elapsed = wait_start.elapsed();
+
+    Ok(StartupTiming {
+        total_ms: (rpc_elapsed + wait_elapsed).as_millis() as u64,
+    })
 }
 
-/// Hot start: `kill_existing=false` so a backgrounded / suspended app
-/// gets brought forward without re-initialising. On iOS this is
-/// essentially the time to resume the suspended process and let
-/// UIApplicationDelegate's `applicationWillEnterForeground`
-/// complete.
+/// Hot start: bring an existing process forward without re-init.
 ///
-/// Foreground-app handling: if the target is already foreground,
-/// launching it via processcontrol is a no-op (returns the existing
-/// PID with no UI work, producing a degenerate timing dominated by
-/// DTX channel overhead and visibly "nothing happened"). We
-/// pre-background the target by launching SpringBoard — iOS's home-
-/// screen process — which is the closest equivalent to Android's
-/// HOME keyevent that we have via processcontrol. Then we wait for
-/// the home transition and measure the actual relaunch.
-///
-/// If the app isn't running at all, the post-Springboard launch is
-/// effectively a cold start (KillExisting=false = "preserve if
-/// present, launch if absent"). We don't try to detect-then-reject
-/// that case; reporting "hot = cold time" when there was nothing to
-/// resume is informative enough.
-///
-/// Caveat: each `launch_app_with_options` builds its own
-/// CoreDeviceProxy + RSD + DTX channel (~1-2s setup). Two
-/// back-to-back calls means the user waits ~2-3s for the
-/// measurement. Acceptable for an explicit "测试" click.
+/// SpringBoard pre-step ensures the target is backgrounded so the
+/// launchApp call has something meaningful to do — without it,
+/// foreground targets no-op with `LaunchState: UNKNOWN`. We don't
+/// use the sysmontap-PID proxy here: the target was already in the
+/// sample stream before the launch (background process still counts
+/// as "running"), so "first sample with PID" arrives immediately and
+/// tells us nothing about UI re-attach time. RPC-only timing is the
+/// best honest signal we have for this mode.
 pub async fn measure_hot_start(udid: &str, bundle_id: &str) -> Result<StartupTiming> {
-    // Best-effort background-step. SpringBoard is always running on
-    // a normal iOS device, so launching it should always succeed —
-    // it just brings the home screen forward. Errors here are
-    // logged but not propagated; falling back to a direct measure
-    // gives the user the original (sometimes-no-op) behaviour
-    // rather than failing the whole measurement.
     if let Err(e) = launch_app_with_options(udid, "com.apple.springboard", false).await {
         tracing::debug!(error = %e, "hot start: SpringBoard pre-launch failed; measuring direct launch");
     } else {
-        // Empirical: ~500ms covers the springboard transition on a
-        // recent iPhone. iOS animation timing is fairly consistent
-        // across hardware (unlike Samsung's variable home animation).
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    measure(udid, bundle_id, false).await
-}
-
-async fn measure(udid: &str, bundle_id: &str, kill_existing: bool) -> Result<StartupTiming> {
     let (_pid, rpc_elapsed) =
-        launch_app_with_options_timed(udid, bundle_id, kill_existing).await?;
+        launch_app_with_options_timed(udid, bundle_id, false).await?;
     Ok(StartupTiming {
         total_ms: rpc_elapsed.as_millis() as u64,
     })
+}
+
+/// Build a fresh DTX RemoteServerClient — same boilerplate as
+/// launch.rs but exposed here so measure_cold_start can mount a
+/// sysmontap channel on its own session.
+async fn build_dtx_remote(udid: &str) -> Result<RemoteServerClient<Box<dyn ReadWrite>>> {
+    let provider = connect::provider_for(udid).await.context("provider_for")?;
+    let proxy = CoreDeviceProxy::connect(&*provider)
+        .await
+        .context("CoreDeviceProxy::connect")?;
+    let rsd_port = proxy.tunnel_info().server_rsd_port;
+    let adapter = proxy
+        .create_software_tunnel()
+        .context("create_software_tunnel")?;
+    let mut handle = adapter.to_async_handle();
+    let rsd_stream = handle
+        .connect(rsd_port)
+        .await
+        .map_err(|e| anyhow!("adapter connect rsd: {e}"))?;
+    let handshake = RsdHandshake::new(rsd_stream)
+        .await
+        .context("RsdHandshake::new")?;
+
+    const DTSERVICEHUB: &str = "com.apple.instruments.dtservicehub";
+    let dvt_port = handshake
+        .services
+        .get(DTSERVICEHUB)
+        .ok_or_else(|| anyhow!("RSD service '{DTSERVICEHUB}' not advertised"))?
+        .port;
+    let dvt_stream = handle
+        .connect(dvt_port)
+        .await
+        .map_err(|e| anyhow!("connect dvt port {dvt_port}: {e}"))?;
+    let boxed: Box<dyn ReadWrite> = Box::new(dvt_stream);
+    Ok(RemoteServerClient::new(boxed))
 }

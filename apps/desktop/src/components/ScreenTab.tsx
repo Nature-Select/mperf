@@ -129,8 +129,9 @@ function StartupSection({
         hint={
           'force-stop 后重启的总时长。' +
           'Android: am start -W TotalTime（kernel 测量,等到首帧渲染完成）。' +
-          'iOS: processcontrol launchApp RPC 时长(进程创建到 PID 返回,不等 UIKit 初始化和首帧)—— ' +
-          '所以 iOS 数字明显小于 Android,这是 Apple RPC 语义差异,不是测量误差。'
+          'iOS: launchApp RPC 时长 + 等待新 PID 出现在 sysmontap 样本里的时间' +
+          '(代理"app 开始 emit 系统活动"≈首帧附近),不含 DTX 通道建立的 host overhead。' +
+          'iOS 一次测量约 3-5 秒(两次独立 DTX session 建立)。数字仍可能略小于 Android。'
         }
         valueMs={coldMs}
         running={busy === 'cold'}
