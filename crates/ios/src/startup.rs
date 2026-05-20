@@ -15,7 +15,7 @@
 
 use crate::launch::launch_app_with_options;
 use anyhow::Result;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub struct StartupTiming {
@@ -34,15 +34,42 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
 /// gets brought forward without re-initialising. On iOS this is
 /// essentially the time to resume the suspended process and let
 /// UIApplicationDelegate's `applicationWillEnterForeground`
-/// complete — typically much shorter than cold.
+/// complete.
 ///
-/// If the app isn't running at all, processcontrol falls through to
-/// a cold launch (KillExisting=false is "preserve if present, launch
-/// if absent"), which makes the measurement effectively a cold-start
-/// time. We don't try to detect-then-reject that case; reporting "hot
-/// = cold time" when there was nothing to resume is informative
-/// enough.
+/// Foreground-app handling: if the target is already foreground,
+/// launching it via processcontrol is a no-op (returns the existing
+/// PID with no UI work, producing a degenerate timing dominated by
+/// DTX channel overhead and visibly "nothing happened"). We
+/// pre-background the target by launching SpringBoard — iOS's home-
+/// screen process — which is the closest equivalent to Android's
+/// HOME keyevent that we have via processcontrol. Then we wait for
+/// the home transition and measure the actual relaunch.
+///
+/// If the app isn't running at all, the post-Springboard launch is
+/// effectively a cold start (KillExisting=false = "preserve if
+/// present, launch if absent"). We don't try to detect-then-reject
+/// that case; reporting "hot = cold time" when there was nothing to
+/// resume is informative enough.
+///
+/// Caveat: each `launch_app_with_options` builds its own
+/// CoreDeviceProxy + RSD + DTX channel (~1-2s setup). Two
+/// back-to-back calls means the user waits ~2-3s for the
+/// measurement. Acceptable for an explicit "测试" click.
 pub async fn measure_hot_start(udid: &str, bundle_id: &str) -> Result<StartupTiming> {
+    // Best-effort background-step. SpringBoard is always running on
+    // a normal iOS device, so launching it should always succeed —
+    // it just brings the home screen forward. Errors here are
+    // logged but not propagated; falling back to a direct measure
+    // gives the user the original (sometimes-no-op) behaviour
+    // rather than failing the whole measurement.
+    if let Err(e) = launch_app_with_options(udid, "com.apple.springboard", false).await {
+        tracing::debug!(error = %e, "hot start: SpringBoard pre-launch failed; measuring direct launch");
+    } else {
+        // Empirical: ~500ms covers the springboard transition on a
+        // recent iPhone. iOS animation timing is fairly consistent
+        // across hardware (unlike Samsung's variable home animation).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     measure(udid, bundle_id, false).await
 }
 
