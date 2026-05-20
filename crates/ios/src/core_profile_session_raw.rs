@@ -522,7 +522,11 @@ async fn read_lenient<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result
             .await
             .map_err(|e| anyhow!("dtx payload read: {e}"))?;
         packet_data.extend(payload_buf);
-        if fragment_id == fragment_count - 1 {
+        // Done when this is the last fragment of the set. `fragment_count`
+        // is sometimes 0 in pings from the device — treat that as a
+        // single-fragment message and break.
+        let last_fragment = fragment_count == 0 || fragment_id + 1 >= fragment_count;
+        if last_fragment {
             break (identifier, conversation_index, channel);
         }
     };
