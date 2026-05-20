@@ -46,7 +46,45 @@ pub struct StartupTiming {
 }
 
 pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTiming> {
-    tracing::info!(bundle_id, "measure_cold_start begin");
+    // Retry wrapper. iOS 26's kperf release after a previous session
+    // is asynchronous — the previous DTServiceHub child can take
+    // a few seconds to fully exit, during which a new acquire fails
+    // (sometimes with an explicit `_lockKPerf` notice, sometimes
+    // silently). We retry up to 3 times with growing backoff. On
+    // success, we return the value. On all-failures, we return the
+    // last error.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match measure_cold_start_once(udid, bundle_id).await {
+            Ok(t) => {
+                if attempt > 1 {
+                    tracing::info!(attempt, "measure_cold_start: succeeded on retry");
+                }
+                return Ok(t);
+            }
+            Err(e) => {
+                if attempt < MAX_ATTEMPTS {
+                    let backoff = Duration::from_millis(2000 * attempt as u64);
+                    tracing::warn!(
+                        attempt,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %e,
+                        "measure_cold_start: attempt failed, sleeping then retrying"
+                    );
+                    last_err = Some(e);
+                    tokio::time::sleep(backoff).await;
+                } else {
+                    last_err = Some(e);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("measure_cold_start: exhausted retries")))
+}
+
+async fn measure_cold_start_once(udid: &str, bundle_id: &str) -> Result<StartupTiming> {
+    tracing::info!(bundle_id, "measure_cold_start_once begin");
     if let Err(e) = launch_app_with_options(udid, "com.apple.springboard", false).await {
         tracing::info!(error = %e, "cold start: SpringBoard pre-launch failed; continuing");
     } else {
@@ -54,9 +92,6 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
     }
     tracing::info!("cold start: SpringBoard prep done");
 
-    // Get-or-create the long-lived coreprofile session for this
-    // device. The session stays alive across measurements; we never
-    // explicitly stop kperf.
     let session = acquire_session(udid).await?;
     let mut cp = session.lock().await;
     tracing::info!("cold start: coreprofile session acquired");
@@ -93,10 +128,6 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
         .capture_post_launch_timestamp(&mti, Duration::from_secs(3))
         .await;
 
-    // If the session reports the device is wedged, drop it from the
-    // pool — next attempt will rebuild a fresh transport. (Won't
-    // always help on iOS 26 — kperf may stay broken until mperf
-    // restarts — but at least we try.)
     let last_ts = match result {
         Ok(ts) => ts,
         Err(e) => {
