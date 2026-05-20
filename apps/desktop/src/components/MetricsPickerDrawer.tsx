@@ -1,14 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Checkbox, Drawer, Input, Tag, Tooltip, Typography } from '@arco-design/web-react'
+import { Checkbox, Drawer, Input, Select, Tag, Tooltip, Typography } from '@arco-design/web-react'
 import { Plus, Search, X } from 'lucide-react'
 import {
   CATEGORIES,
   DEFAULT_SELECTED_IDS,
+  INTERVAL_OPTIONS_MS,
   METRICS,
+  formatInterval,
   type MetricItem,
   categoryOf,
 } from '@/lib/metricsCatalog'
 import { useMetricsSelection } from '@/lib/useMetricsSelection'
+import { useMetricFrequencies } from '@/lib/useMetricFrequencies'
 import styles from './MetricsPickerDrawer.module.scss'
 
 const { Text } = Typography
@@ -87,6 +90,7 @@ export function MetricsPickerDrawer({ recording = false }: { recording?: boolean
 
 function MetricsPickerPanel({ onClose }: { onClose: () => void }) {
   const { selected, toggle, setMany, commit } = useMetricsSelection()
+  const { resolve: resolveInterval, set: setInterval } = useMetricFrequencies()
   const [query, setQuery] = useState('')
 
   const filtered = useMemo(() => {
@@ -206,6 +210,8 @@ function MetricsPickerPanel({ onClose }: { onClose: () => void }) {
                       item={m}
                       checked={selected.has(m.id)}
                       onToggle={() => toggle(m.id)}
+                      intervalMs={resolveInterval(m.id)}
+                      onIntervalChange={(ms) => setInterval(m.id, ms)}
                     />
                   ))}
                 </div>
@@ -222,10 +228,17 @@ function MetricRow({
   item,
   checked,
   onToggle,
+  intervalMs,
+  onIntervalChange,
 }: {
   item: MetricItem
   checked: boolean
   onToggle: () => void
+  /// Effective interval (catalog default or user override). `undefined`
+  /// for non-chart-backed items (capture placeholders) — no dropdown
+  /// rendered in that case.
+  intervalMs: number | undefined
+  onIntervalChange: (ms: number) => void
 }) {
   const cat = categoryOf(item.category)
   // `previewable` items can be toggled even when the sampler isn't
@@ -237,6 +250,11 @@ function MetricRow({
     if (disabled) return
     onToggle()
   }
+  // Frequency dropdown only for chart-backed metrics — capture
+  // placeholders and "no-sampler" rows don't have a cadence to tune.
+  // Hidden until the metric is checked so users don't fiddle with
+  // rates that aren't actively recording.
+  const showInterval = intervalMs != null && checked && item.implemented
   return (
     <div
       role="checkbox"
@@ -280,12 +298,28 @@ function MetricRow({
         </div>
         <div className={styles.rowDesc}>{item.description}</div>
       </div>
-      <Checkbox
-        checked={checked}
-        disabled={disabled}
-        onChange={() => onToggle()}
-        onClick={(e) => e.stopPropagation()}
-      />
+      <div className={styles.rowTrailing} onClick={(e) => e.stopPropagation()}>
+        {showInterval && (
+          <Select
+            size="mini"
+            value={intervalMs}
+            onChange={(v) => onIntervalChange(Number(v))}
+            triggerProps={{ autoAlignPopupWidth: false }}
+            className={styles.intervalSelect}
+          >
+            {INTERVAL_OPTIONS_MS.map((ms) => (
+              <Select.Option key={ms} value={ms}>
+                {formatInterval(ms)}
+              </Select.Option>
+            ))}
+          </Select>
+        )}
+        <Checkbox
+          checked={checked}
+          disabled={disabled}
+          onChange={() => onToggle()}
+        />
+      </div>
     </div>
   )
 }

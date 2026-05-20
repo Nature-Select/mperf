@@ -40,6 +40,7 @@ import { LogTerminal } from '@/components/LogTerminal'
 import { SidebarTabs } from '@/components/SidebarTabs'
 import { useResizableSidebar } from '@/lib/useResizableSidebar'
 import { useMetricsSelection } from '@/lib/useMetricsSelection'
+import { snapshotEffectiveFrequencies, useMetricFrequencies } from '@/lib/useMetricFrequencies'
 import chartStyles from '@/components/chart-shared.module.scss'
 
 const { Sider, Content } = Layout
@@ -63,6 +64,7 @@ export function LiveView({
   // — every toggle in the picker writes localStorage and broadcasts a
   // CustomEvent, so this hook stays in sync without prop drilling.
   const { selected: metricsSelection } = useMetricsSelection()
+  const { map: metricFrequencies } = useMetricFrequencies()
   const { data, isLoading } = useQuery({
     queryKey: ['devices'],
     queryFn: listDevices,
@@ -168,6 +170,10 @@ export function LiveView({
         // of this session always reflects "what the user was focused
         // on at the time", independent of later picker changes.
         Array.from(metricsSelection),
+        // Same snapshot principle for per-card sampling cadence —
+        // the session's samplers run at these intervals and the
+        // History view shows what was actually captured.
+        snapshotEffectiveFrequencies(metricFrequencies),
       )
       setActiveSessionId(sid)
       setNotice({ kind: 'success', text: `Session #${sid} recording`, auto: true })
