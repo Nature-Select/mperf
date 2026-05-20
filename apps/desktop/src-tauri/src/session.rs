@@ -249,29 +249,39 @@ fn build_samplers(
                 pick(&["gpu"], 1000),
             )),
         ],
-        Platform::Ios => vec![
-            // iOS sysmontap is one channel producing cpu_total /
-            // cpu_app / per-core / app-mem / system-mem. All three
-            // chart-cards backed by it share its cadence — we pick
-            // the min so each card's view rate is honoured.
-            Box::new(IosCpuSampler::new(
-                device_id,
-                target_pkg.clone(),
-                pick(&["cpu_usage", "cpu_core", "memory"], 1000) as u32,
-            )),
-            // graphics.opengl channel produces the Tiler/Renderer/
-            // Device GPU triplet plus CoreAnimation FPS — frame and
-            // gpu cards share its cadence.
-            Box::new(IosGraphicsSampler::new(
-                device_id,
-                pick(&["gpu", "frame"], 1000) as u32,
-            )),
-            // No iOS battery sampler: lockdown queries return empty while
-            // our CoreDeviceProxy DTX tunnel is held (iOS 17+ behavior).
-            // The proper fix is to use Instruments DTX power services on
-            // the same RemoteServerClient — see docs/architecture.md and
-            // crates/ios/src/battery.rs (kept for future reference).
-        ],
+        Platform::Ios => {
+            // iOS sampler ctors take u32 (sysmontap and graphics.opengl
+            // both encode interval as a 32-bit DTX integer). `pick`
+            // returns u64 because that's the on-wire type. A plain
+            // `as u32` would silently truncate if a future caller sent
+            // a value > u32::MAX; saturating cast keeps the cap honest
+            // even though the discrete catalog options (500-10000ms)
+            // can't get anywhere near the boundary today.
+            let to_u32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+            vec![
+                // iOS sysmontap is one channel producing cpu_total /
+                // cpu_app / per-core / app-mem / system-mem. All three
+                // chart-cards backed by it share its cadence — we pick
+                // the min so each card's view rate is honoured.
+                Box::new(IosCpuSampler::new(
+                    device_id,
+                    target_pkg.clone(),
+                    to_u32(pick(&["cpu_usage", "cpu_core", "memory"], 1000)),
+                )),
+                // graphics.opengl channel produces the Tiler/Renderer/
+                // Device GPU triplet plus CoreAnimation FPS — frame and
+                // gpu cards share its cadence.
+                Box::new(IosGraphicsSampler::new(
+                    device_id,
+                    to_u32(pick(&["gpu", "frame"], 1000)),
+                )),
+                // No iOS battery sampler: lockdown queries return empty while
+                // our CoreDeviceProxy DTX tunnel is held (iOS 17+ behavior).
+                // The proper fix is to use Instruments DTX power services on
+                // the same RemoteServerClient — see docs/architecture.md and
+                // crates/ios/src/battery.rs (kept for future reference).
+            ]
+        }
     }
 }
 
