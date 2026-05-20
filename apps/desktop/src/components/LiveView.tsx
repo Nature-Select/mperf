@@ -683,9 +683,6 @@ export function LiveView({
             <ScreenTab
               screenshotOn={metricsSelection.has('screenshot')}
               startupTimingOn={metricsSelection.has('startup_timing')}
-              deviceId={selected.id}
-              platform={selected.platform}
-              targetPkg={targetPkg || null}
               autoStartup={autoStartup}
             />
             {/*

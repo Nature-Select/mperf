@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
-import { Button, Message, Tooltip } from '@arco-design/web-react'
-import { Info, Play } from 'lucide-react'
-import { Platform, measureStartup, type StartupMode } from '@/lib/ipc'
+import { Tooltip } from '@arco-design/web-react'
+import { Info } from 'lucide-react'
+import { type StartupMode } from '@/lib/ipc'
 import styles from './ScreenTab.module.scss'
 
 interface Props {
@@ -9,37 +9,28 @@ interface Props {
   /// the dark capture strip.
   screenshotOn: boolean
   /// Whether the Startup Timing metric is selected — controls the
-  /// cold / hot startup measurement rows.
+  /// single startup-timing readout row.
   startupTimingOn: boolean
-  /// Active device + selected app — both needed to fire `measureStartup`.
-  /// `null` for either disables the buttons with a tooltip.
-  deviceId: string | null
-  platform: Platform | null
-  targetPkg: string | null
   /// Forwarded from LiveView's `startSession` response — the launch
-  /// that just happened got auto-measured (mode detected from "is the
-  /// app already running"). Each new value populates the matching
-  /// row so the user doesn't need to click "测试" to see the data.
+  /// that just happened got auto-measured (mode detected from "is
+  /// the app already running"). Mirrors into the row so the user can
+  /// see the value without doing anything extra.
   autoStartup: { mode: StartupMode; total_ms: number } | null
 }
 
 /// Top strip above the chart list — mirrors PerfDog's "SceneTab".
 ///
 /// Two halves, independently gated by metrics-picker selection:
-/// 1. `ScreenShot` toggles the dark capture surface (PerfDog grabs a
-///    still frame every ~2 s; backend not implemented yet, so this is
-///    a placeholder).
-/// 2. `Startup Timing` toggles a Cold / Hot start measurement row.
-///    Each row has a "测试" button that force-restarts (cold) or
-///    foregrounds (hot) the selected app and reports the total ms.
-///    Values persist into `sessions.startup_timings` when a recording
-///    session is active for the same app.
+/// 1. `ScreenShot` toggles the dark capture surface.
+/// 2. `Startup Timing` toggles a single readout row.
+///    Measurement fires automatically at session start: backend
+///    detects whether the target app is already running (→ hot) or
+///    needs a launch (→ cold) and measures once. No manual button —
+///    iOS 26 only supports one kperf consumer per mperf process
+///    lifetime, so multi-shot measurement on demand isn't feasible.
 export function ScreenTab({
   screenshotOn,
   startupTimingOn,
-  deviceId,
-  platform,
-  targetPkg,
   autoStartup,
 }: Props) {
   if (!screenshotOn && !startupTimingOn) return null
@@ -52,156 +43,44 @@ export function ScreenTab({
           </div>
         </div>
       )}
-      {startupTimingOn && (
-        <StartupSection
-          deviceId={deviceId}
-          platform={platform}
-          targetPkg={targetPkg}
-          autoStartup={autoStartup}
-        />
-      )}
+      {startupTimingOn && <StartupReadout autoStartup={autoStartup} />}
     </div>
   )
 }
 
-function StartupSection({
-  deviceId,
-  platform,
-  targetPkg,
+function StartupReadout({
   autoStartup,
 }: {
-  deviceId: string | null
-  platform: Platform | null
-  targetPkg: string | null
   autoStartup: { mode: StartupMode; total_ms: number } | null
 }) {
-  const [coldMs, setColdMs] = useState<number | null>(null)
-  const [hotMs, setHotMs] = useState<number | null>(null)
-  const [busy, setBusy] = useState<StartupMode | null>(null)
+  const [value, setValue] = useState<{ mode: StartupMode; total_ms: number } | null>(null)
 
   // Mirror each new auto-measurement (from start_session response)
-  // into the matching row. Reference equality on `autoStartup` is
-  // enough — LiveView creates a fresh object per Start.
+  // into the row. Reference equality on `autoStartup` is enough —
+  // LiveView creates a fresh object per Start.
   useEffect(() => {
-    if (!autoStartup) return
-    if (autoStartup.mode === 'cold') setColdMs(autoStartup.total_ms)
-    else setHotMs(autoStartup.total_ms)
+    if (autoStartup) setValue(autoStartup)
   }, [autoStartup])
 
-  const canMeasure = !!deviceId && !!platform && !!targetPkg && busy === null
-  const disabledReason = !deviceId
-    ? '先选设备'
-    : !targetPkg
-      ? '先选目标 app'
-      : busy
-        ? `${busy === 'cold' ? '冷启动' : '热启动'}测试中…`
-        : null
-
-  const run = async (mode: StartupMode) => {
-    if (!canMeasure || !deviceId || !platform || !targetPkg) return
-    setBusy(mode)
-    try {
-      const res = await measureStartup(deviceId, platform, targetPkg, mode)
-      if (mode === 'cold') setColdMs(res.total_ms)
-      else setHotMs(res.total_ms)
-      if (res.persisted_to_session) {
-        Message.success({
-          content: `${mode === 'cold' ? '冷' : '热'}启动 ${res.total_ms} ms · 已记入 session #${res.persisted_to_session}`,
-          duration: 3000,
-        })
-      } else {
-        Message.success({
-          content: `${mode === 'cold' ? '冷' : '热'}启动 ${res.total_ms} ms`,
-          duration: 2500,
-        })
-      }
-    } catch (e) {
-      Message.error({ content: String(e), duration: 5000 })
-    } finally {
-      setBusy(null)
-    }
-  }
+  const valueText = value == null ? '—' : `${value.total_ms} ms`
+  const typeText =
+    value == null ? '等待录制' : value.mode === 'cold' ? '冷启动' : '热启动'
+  const hint =
+    '点击「录制」时自动测量。' +
+    '若 app 未在跑(后台或被杀)记为冷启动,在跑(前台或后台)记为热启动。' +
+    'Android 通过 am start -W TotalTime(kernel 测量到首帧);' +
+    'iOS 冷启动通过 coreprofilesessiontap 的 kdebug 事件流估算首帧,热启动取 processcontrol launchApp RPC 时长。' +
+    'iOS 冷启动每个 mperf 进程生命周期只能测一次 — 想重测,停止录制后重新开始。'
 
   return (
     <div className={styles.startupSection}>
-      <StartupRow
-        label="冷启动"
-        hint={
-          'force-stop 后重启的总时长。' +
-          'Android: am start -W TotalTime（kernel 测量,等到首帧渲染完成）。' +
-          'iOS: processcontrol launchApp RPC 时长(进程创建到 PID 返回,不等 UIKit 初始化和首帧)。' +
-          '所以 iOS 数字会明显小于 Android,这是 Apple RPC 语义差异,不是测量误差。' +
-          '想要 iOS 真正的"首帧时长"需要订阅 DTX trace events,工作量大,留作后续。'
-        }
-        valueMs={coldMs}
-        running={busy === 'cold'}
-        disabled={!canMeasure}
-        disabledReason={disabledReason ?? ''}
-        onRun={() => run('cold')}
-      />
-      <StartupRow
-        label="热启动"
-        hint={
-          'app 在后台时拉到前台测的时长,反映 UI 重建+恢复开销。' +
-          'Android: am start -W TotalTime;若 app 已前台,自动按 HOME 退后台再测。' +
-          'iOS: launchApp RPC 时长;若 app 已前台,先 launch SpringBoard 把它推到后台再测。' +
-          '若 app 没在跑会退化为冷启动行为。'
-        }
-        valueMs={hotMs}
-        running={busy === 'hot'}
-        disabled={!canMeasure}
-        disabledReason={disabledReason ?? ''}
-        onRun={() => run('hot')}
-      />
-    </div>
-  )
-}
-
-function StartupRow({
-  label,
-  hint,
-  valueMs,
-  running,
-  disabled,
-  disabledReason,
-  onRun,
-}: {
-  label: string
-  hint: string
-  valueMs: number | null
-  running: boolean
-  disabled: boolean
-  disabledReason: string
-  onRun: () => void
-}) {
-  const valueText = valueMs == null ? '—' : `${valueMs} ms`
-  const btn = (
-    <Button
-      size="mini"
-      type="outline"
-      icon={<Play size={11} />}
-      onClick={onRun}
-      disabled={disabled}
-      loading={running}
-    >
-      测试
-    </Button>
-  )
-  return (
-    <div className={styles.startupRow}>
-      <span className={styles.startupLabel}>{label}:</span>
-      <span className={styles.startupValue}>{valueText}</span>
-      <Tooltip content={hint} position="bottom">
-        <Info size={11} className={styles.startupHint} />
-      </Tooltip>
-      <div className={styles.startupAction}>
-        {disabled && disabledReason ? (
-          <Tooltip content={disabledReason}>
-            <span>{btn}</span>
-          </Tooltip>
-        ) : (
-          btn
-        )}
+      <div className={styles.startupRow}>
+        <span className={styles.startupLabel}>启动时间:</span>
+        <span className={styles.startupValue}>{valueText}</span>
+        <span className={styles.startupType}>· {typeText}</span>
+        <Tooltip content={hint} position="bottom">
+          <Info size={11} className={styles.startupHint} />
+        </Tooltip>
       </div>
     </div>
   )

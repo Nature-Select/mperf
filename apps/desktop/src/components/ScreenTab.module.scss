@@ -64,11 +64,11 @@
   min-width: 64px;
 }
 
+.startupType {
+  color: var(--color-text-3);
+}
+
 .startupHint {
   color: var(--color-text-3);
   cursor: help;
-}
-
-.startupAction {
-  margin-left: auto;
 }
