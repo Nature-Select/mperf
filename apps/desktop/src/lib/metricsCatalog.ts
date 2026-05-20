@@ -42,6 +42,22 @@ export interface MetricItem {
   /// Platforms that actually surface this metric at runtime. Items work
   /// on every platform listed here once `implemented: true`.
   platforms: Platform[]
+  /// Default sampling interval (ms). Picker shows a dropdown next to
+  /// the row to override; the value is per-card. Absent ⇒ the row
+  /// isn't a chart-card-backed metric (e.g. ScreenShot / Startup
+  /// Timing / placeholders), and no frequency knob shows.
+  defaultIntervalMs?: number
+}
+
+/// Sampling intervals offered in the picker dropdown. PerfDog uses a
+/// similar discrete set — continuous input adds little value and
+/// confuses users who pick non-round numbers. Sub-500ms is excluded:
+/// at 100-200ms cadence adb shell overhead and DTX channel jitter
+/// dominate the data, not a useful regime.
+export const INTERVAL_OPTIONS_MS = [500, 1000, 2000, 5000, 10000] as const
+
+export function formatInterval(ms: number): string {
+  return ms >= 1000 ? `${ms / 1000}s` : `${ms}ms`
 }
 
 export interface CategoryDef {
@@ -101,6 +117,7 @@ export const METRICS: MetricItem[] = [
     abbr: 'F',
     implemented: true,
     platforms: ['android', 'ios'],
+    defaultIntervalMs: 1000,
   },
 
   // ─── CPU ─────────────────────────────────────────────────────────────
@@ -112,6 +129,7 @@ export const METRICS: MetricItem[] = [
     abbr: 'CPU',
     implemented: true,
     platforms: ['android', 'ios'],
+    defaultIntervalMs: 1000,
   },
   {
     id: 'cpu_core',
@@ -121,6 +139,7 @@ export const METRICS: MetricItem[] = [
     abbr: 'CC',
     implemented: true,
     platforms: ['android', 'ios'],
+    defaultIntervalMs: 1000,
   },
   {
     id: 'cpu_thread',
@@ -161,6 +180,7 @@ export const METRICS: MetricItem[] = [
     abbr: 'M',
     implemented: true,
     platforms: ['android', 'ios'],
+    defaultIntervalMs: 1000,
   },
   {
     id: 'memory_detail',
@@ -182,6 +202,7 @@ export const METRICS: MetricItem[] = [
     abbr: 'G',
     implemented: true,
     platforms: ['android', 'ios'],
+    defaultIntervalMs: 1000,
   },
   {
     id: 'gpu_clock',
@@ -214,6 +235,7 @@ export const METRICS: MetricItem[] = [
     abbr: 'T',
     implemented: true,
     platforms: ['android'],
+    defaultIntervalMs: 2000,
   },
   {
     id: 'thermal_status',

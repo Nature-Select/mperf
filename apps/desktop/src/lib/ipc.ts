@@ -119,6 +119,11 @@ export function startSession(
   /// (and an empty array) is treated as "show every captured metric"
   /// by the backend — same fallback path older sessions take.
   selectedMetrics?: string[],
+  /// Per-chart-card sampling interval (ms). Backend maps each card to
+  /// its owning sampler — multiple cards may share one sampler, in
+  /// which case the sampler runs at the fastest requested rate.
+  /// `undefined` ⇒ samplers use their hardcoded defaults.
+  samplingIntervals?: Record<string, number>,
 ): Promise<number> {
   return invoke<number>('start_session', {
     deviceId,
@@ -126,6 +131,7 @@ export function startSession(
     deviceModel,
     targetPkg,
     selectedMetrics,
+    samplingIntervals,
   })
 }
 
@@ -174,6 +180,10 @@ export interface SessionInfo {
   /// supply a selection — both are rendered as "show every metric this
   /// session has data for" by the History view.
   selected_metrics: string[] | null
+  /// Snapshot of the per-card sampling intervals (ms) at recording
+  /// start. `null` on pre-v6 sessions; UI may surface "录制频率"
+  /// info in the session header when present.
+  sampling_intervals: Record<string, number> | null
 }
 
 export interface SamplePoint {
