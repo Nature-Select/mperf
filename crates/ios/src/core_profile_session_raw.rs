@@ -180,7 +180,9 @@ impl CoreProfileSessionRaw {
 
     async fn consume_initial_capabilities(&mut self) -> Result<()> {
         // First push on channel 0 is _notifyOfPublishedCapabilities:.
-        // We read once and discard.
+        // We read once and discard. If the device piles on additional
+        // state pushes (rare, but happens on rapid reconnects), the
+        // next mount_channel_correlated loop will skip them anyway.
         let _msg = self.read_lenient().await?;
         Ok(())
     }
@@ -342,6 +344,24 @@ impl CoreProfileSessionRaw {
         let _ = self
             .send_message(ch, msg_id, Some("stop"), None, false)
             .await;
+        // Drain & discard whatever the device pushes for 800ms so
+        // kperf is fully shut down on the device side before we
+        // close the socket. Without this, a second cold-start
+        // measurement on the same device hits "kperf already owned"
+        // (silent) and the kdebug stream never resumes.
+        let drain_deadline = std::time::Instant::now() + Duration::from_millis(800);
+        loop {
+            let remaining = drain_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.read_lenient()).await {
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        tracing::info!("coreprofile: stop drained");
         Ok(())
     }
 
