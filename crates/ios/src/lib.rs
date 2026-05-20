@@ -18,6 +18,7 @@ mod devices;
 mod graphics;
 mod graphics_raw;
 mod launch;
+mod startup;
 mod os_trace;
 mod pid_resolver;
 // `syslog_relay` proved too sparse on modern iOS — virtually every
@@ -36,6 +37,7 @@ pub use cpu::{resolve_bundle_to_exec, CpuSampler};
 pub use devices::{device_info, list_devices};
 pub use graphics::GraphicsSampler;
 pub use launch::launch_app;
+pub use startup::{measure_cold_start, measure_hot_start, StartupTiming};
 pub use os_trace::{fetch_active_pids, OsTraceStream};
 pub use pid_resolver::{resolve_bundle_to_pids, BundleResolution};
 #[allow(unused_imports)]

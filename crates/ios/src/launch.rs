@@ -20,17 +20,29 @@ use idevice::{
 };
 
 /// Launch `bundle_id` via Instruments processcontrol. Returns the new
-/// PID on success.
+/// PID on success. Convenience wrapper that preserves running state
+/// (kill_existing=false) — used by start_recording so the user's
+/// foregrounded app doesn't get killed if they already have it open.
+pub async fn launch_app(udid: &str, bundle_id: &str) -> Result<u64> {
+    launch_app_with_options(udid, bundle_id, false).await
+}
+
+/// Launch `bundle_id`, choosing whether to terminate any existing
+/// instance first. `kill_existing=true` gives a clean cold-start
+/// measurement; `false` brings a backgrounded app forward without
+/// re-initialising it (hot-start path).
 ///
-/// `kill_existing=false`: if the user already has the app foregrounded
-/// with state worth preserving, we don't disrupt them. `start_suspended
-/// =false`: the app comes up immediately so the samplers' first ticks
-/// find a PID instead of emitting zeros.
+/// `start_suspended=false`: the app comes up immediately so the
+/// samplers' first ticks find a PID instead of emitting zeros.
 ///
 /// Setup overhead is ~1–2 s (one fresh CoreDeviceProxy + RSD + DTX
 /// channel build). Acceptable for a "click record" gesture; not
 /// something to call in a hot loop.
-pub async fn launch_app(udid: &str, bundle_id: &str) -> Result<u64> {
+pub async fn launch_app_with_options(
+    udid: &str,
+    bundle_id: &str,
+    kill_existing: bool,
+) -> Result<u64> {
     let provider = connect::provider_for(udid).await.context("provider_for")?;
     let proxy = CoreDeviceProxy::connect(&*provider)
         .await
@@ -72,7 +84,7 @@ pub async fn launch_app(udid: &str, bundle_id: &str) -> Result<u64> {
             None,  // env_vars
             None,  // arguments
             false, // start_suspended
-            false, // kill_existing
+            kill_existing,
         )
         .await
         .with_context(|| format!("launch_app({bundle_id})"))?;
