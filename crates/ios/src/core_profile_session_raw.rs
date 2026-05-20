@@ -283,7 +283,40 @@ impl CoreProfileSessionRaw {
         config.insert("bm".into(), Value::Integer(1i64.into()));
         config.insert("tc".into(), Value::Array(vec![Value::Dictionary(tc_entry)]));
 
-        let args = vec![AuxValue::archived_value(Value::Dictionary(config))];
+        // Second positional arg — py-ios-device's app_lifecycle demo
+        // sends this in addition to the trace config. pymobiledevice3
+        // omits it (their default usage is one-shot stackshot, not
+        // continuous launch capture). We send it because without
+        // it the device fires one snapshot of the pre-existing
+        // kdebug ring and goes silent. The keys are opaque to us:
+        // `tsf` looks like trigger-set-filter ([65537]), `si` is a
+        // sample interval in ns (5_000_000 = 5ms), `tk:1` is a
+        // different "kind" from tc's `tk:3`.
+        let mut second = Dictionary::new();
+        second.insert(
+            "tsf".into(),
+            Value::Array(vec![Value::Integer(65537i64.into())]),
+        );
+        second.insert(
+            "ta".into(),
+            Value::Array(vec![
+                Value::Array(vec![Value::Integer(0i64.into())]),
+                Value::Array(vec![Value::Integer(2i64.into())]),
+                Value::Array(vec![
+                    Value::Integer(1i64.into()),
+                    Value::Integer(1i64.into()),
+                    Value::Integer(0i64.into()),
+                ]),
+            ]),
+        );
+        second.insert("si".into(), Value::Integer(5_000_000i64.into()));
+        second.insert("tk".into(), Value::Integer(1i64.into()));
+        second.insert("uuid".into(), Value::String(uuid_string()));
+
+        let args = vec![
+            AuxValue::archived_value(Value::Dictionary(config)),
+            AuxValue::archived_value(Value::Dictionary(second)),
+        ];
         let msg_id = self.next_identifier();
         self.send_message(ch, msg_id, Some("setConfig:"), Some(args), false)
             .await
@@ -362,13 +395,23 @@ impl CoreProfileSessionRaw {
             // for an NSData payload to parse as kd_buf records.
             if bytes.starts_with(b"bplist") {
                 match extract_inner_data(&bytes) {
-                    Some(inner) if inner.len() >= 64 && inner.len() % 64 == 0 => {
-                        let events = parse_kd_buf_records(&inner);
+                    Some(inner) if inner.len() >= 64 => {
+                        // bm=1 streams add a variable-length preamble
+                        // before the 64-byte kd_buf records (~46 bytes
+                        // observed). Try parsing from the trailing
+                        // (inner_len % 64)-bytes-aligned offset; if
+                        // that gives plausible records (any of class
+                        // 0x1F / 0x2B / 0x31 present, or just a
+                        // non-empty parse), return them.
+                        let preamble = inner.len() % 64;
+                        let events = parse_kd_buf_records(&inner[preamble..]);
                         if !events.is_empty() {
-                            tracing::trace!(
+                            tracing::info!(
                                 outer = bytes.len(),
                                 inner = inner.len(),
+                                preamble,
                                 n_events = events.len(),
+                                first8 = ?&inner[..inner.len().min(8)],
                                 "next_events: unwrapped DTKTraceTapMessage → kdebug batch"
                             );
                             return Ok(events);
@@ -378,7 +421,8 @@ impl CoreProfileSessionRaw {
                         tracing::info!(
                             outer = bytes.len(),
                             inner_len = inner.len(),
-                            "next_events: unwrapped NSData but not kd_buf-shaped (skip)"
+                            first8 = ?&inner[..inner.len().min(8)],
+                            "next_events: unwrapped NSData but too small (skip)"
                         );
                     }
                     None => {
