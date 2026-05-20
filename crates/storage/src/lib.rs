@@ -73,14 +73,18 @@ impl Storage {
 
     /// Create a new session row. Returns the auto-assigned id.
     pub async fn create_session(&self, meta: SessionMeta) -> Result<i64> {
-        // `selected_metrics` is stored as a JSON-encoded TEXT column so
-        // the SQL schema doesn't need a separate join table. The list
-        // is small (≤ 30 ids) and read once at session-detail open, so
-        // JSON serialisation cost is negligible.
+        // Snapshots (`selected_metrics`, `sampling_intervals`) live as
+        // JSON-encoded TEXT columns so the SQL schema doesn't grow new
+        // join tables for what's read exactly once at session-detail
+        // open. Serialisation cost is negligible — small structures.
         let selected_json = meta
             .selected_metrics
             .as_ref()
             .map(|v| serde_json::to_string(v).expect("Vec<String> serialises"));
+        let intervals_json = meta
+            .sampling_intervals
+            .as_ref()
+            .map(|m| serde_json::to_string(m).expect("HashMap<String,u64> serialises"));
         let id = self
             .conn
             .call(move |c| {
@@ -88,8 +92,8 @@ impl Storage {
                     "INSERT INTO sessions (
                         wall_start_ms, device_id, device_platform,
                         device_model, app_bundle_id, meta_json,
-                        selected_metrics
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        selected_metrics, sampling_intervals
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         meta.wall_start_ms,
                         meta.device_id,
@@ -98,6 +102,7 @@ impl Storage {
                         meta.app_bundle_id,
                         meta.meta_json,
                         selected_json,
+                        intervals_json,
                     ],
                 )?;
                 Ok(c.last_insert_rowid())
@@ -185,11 +190,12 @@ impl Storage {
             .call(|c| {
                 let mut stmt = c.prepare(
                     "SELECT id, wall_start_ms, wall_end_ms, device_id, device_platform,
-                            device_model, app_bundle_id, selected_metrics
+                            device_model, app_bundle_id, selected_metrics, sampling_intervals
                      FROM sessions ORDER BY wall_start_ms DESC",
                 )?;
                 let it = stmt.query_map([], |row| {
                     let selected_json: Option<String> = row.get(7)?;
+                    let intervals_json: Option<String> = row.get(8)?;
                     Ok(SessionInfo {
                         id: row.get(0)?,
                         wall_start_ms: row.get(1)?,
@@ -199,6 +205,7 @@ impl Storage {
                         device_model: row.get(5)?,
                         app_bundle_id: row.get(6)?,
                         selected_metrics: parse_selected_metrics(selected_json),
+                        sampling_intervals: parse_sampling_intervals(intervals_json),
                     })
                 })?;
                 let mut out = Vec::new();
@@ -218,11 +225,12 @@ impl Storage {
             .call(move |c| {
                 c.query_row(
                     "SELECT id, wall_start_ms, wall_end_ms, device_id, device_platform,
-                            device_model, app_bundle_id, selected_metrics
+                            device_model, app_bundle_id, selected_metrics, sampling_intervals
                      FROM sessions WHERE id = ?",
                     params![id],
                     |row| {
                         let selected_json: Option<String> = row.get(7)?;
+                        let intervals_json: Option<String> = row.get(8)?;
                         Ok(SessionInfo {
                             id: row.get(0)?,
                             wall_start_ms: row.get(1)?,
@@ -232,6 +240,7 @@ impl Storage {
                             device_model: row.get(5)?,
                             app_bundle_id: row.get(6)?,
                             selected_metrics: parse_selected_metrics(selected_json),
+                            sampling_intervals: parse_sampling_intervals(intervals_json),
                         })
                     },
                 )
@@ -444,6 +453,21 @@ fn parse_selected_metrics(raw: Option<String>) -> Option<Vec<String>> {
         Ok(v) => Some(v),
         Err(e) => {
             tracing::warn!(error = %e, raw = %s, "selected_metrics JSON parse failed; treating as 'show all'");
+            None
+        }
+    }
+}
+
+/// Mirror of `parse_selected_metrics` for the per-metric interval
+/// snapshot. Same graceful-degradation policy: corrupt JSON drops to
+/// `None`, treated downstream as "this session predates frequency
+/// configurability".
+fn parse_sampling_intervals(raw: Option<String>) -> Option<std::collections::HashMap<String, u64>> {
+    let s = raw?;
+    match serde_json::from_str::<std::collections::HashMap<String, u64>>(&s) {
+        Ok(m) => Some(m),
+        Err(e) => {
+            tracing::warn!(error = %e, raw = %s, "sampling_intervals JSON parse failed; treating as 'default frequencies'");
             None
         }
     }

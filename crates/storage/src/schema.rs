@@ -15,7 +15,7 @@ use rusqlite::{params, Connection};
 /// Highest schema version known to this build. Surfaced via the
 /// Settings tab so users can sanity-check the on-disk DB after a
 /// migration.
-pub const HEAD: i32 = 5;
+pub const HEAD: i32 = 6;
 
 pub fn run_migrations(c: &mut Connection) -> rusqlite::Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")?;
@@ -139,5 +139,14 @@ const MIGRATIONS: &[(i32, &str)] = &[
         // frontend reads NULL as "show every metric this session has
         // data for", preserving the old default-show-all behaviour.
         "ALTER TABLE sessions ADD COLUMN selected_metrics TEXT;",
+    ),
+    (
+        6,
+        // JSON object mapping metric-id → sampling interval (ms) at
+        // recording time. Same per-session-snapshot pattern as
+        // `selected_metrics` — NULL on pre-6 rows means "the user's
+        // build had no concept of per-metric frequency; samplers ran
+        // at hardcoded defaults".
+        "ALTER TABLE sessions ADD COLUMN sampling_intervals TEXT;",
     ),
 ];

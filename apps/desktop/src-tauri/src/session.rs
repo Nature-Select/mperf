@@ -89,6 +89,7 @@ pub async fn start_recording(
     device_model: Option<String>,
     target_pkg: String,
     selected_metrics: Option<Vec<String>>,
+    sampling_intervals: Option<std::collections::HashMap<String, u64>>,
 ) -> Result<i64, String> {
     tracing::info!(
         device_id = %device_id,
@@ -118,7 +119,8 @@ pub async fn start_recording(
         },
     }
 
-    let samplers = build_samplers(&device_id, platform, target_pkg.clone());
+    let intervals_for_samplers = sampling_intervals.clone().unwrap_or_default();
+    let samplers = build_samplers(&device_id, platform, target_pkg.clone(), &intervals_for_samplers);
     let platform_str = match platform {
         Platform::Android => "android",
         Platform::Ios => "ios",
@@ -135,6 +137,7 @@ pub async fn start_recording(
             app_bundle_id: Some(target_pkg.clone()),
             meta_json: None,
             selected_metrics,
+            sampling_intervals,
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -193,25 +196,76 @@ fn build_samplers(
     device_id: &str,
     platform: Platform,
     target_pkg: String,
+    intervals: &std::collections::HashMap<String, u64>,
 ) -> Vec<Box<dyn Sampler>> {
+    // Resolve the effective interval for a sampler that serves N
+    // chart-cards. When multiple cards share a sampler (e.g. iOS
+    // sysmontap drives cpu_usage / cpu_core / memory at once), the
+    // sampler must run at the fastest cadence any of those cards
+    // requested — over-sampling is harmless, under-sampling loses
+    // data. Cards the user didn't override fall through to `default`.
+    let pick = |card_ids: &[&str], default: u64| -> u64 {
+        card_ids
+            .iter()
+            .filter_map(|id| intervals.get(*id).copied())
+            .min()
+            .unwrap_or(default)
+    };
     match platform {
         Platform::Android => vec![
             // CPU / FPS / memory are all scoped to the user-picked package
             // (PerfDog-style explicit selection; no foreground auto-detect).
-            Box::new(AndroidCpuSampler::new(device_id, target_pkg.clone())),
-            Box::new(AndroidFpsSampler::new(device_id, target_pkg.clone())),
-            Box::new(AndroidMemSampler::new(device_id, target_pkg.clone())),
+            // Android CpuSampler emits Total + App + per-core from one
+            // /proc/stat tick — cpu_usage and cpu_core share its cadence.
+            Box::new(AndroidCpuSampler::new(
+                device_id,
+                target_pkg.clone(),
+                pick(&["cpu_usage", "cpu_core"], 1000),
+            )),
+            Box::new(AndroidFpsSampler::new(
+                device_id,
+                target_pkg.clone(),
+                pick(&["frame"], 1000),
+            )),
+            Box::new(AndroidMemSampler::new(
+                device_id,
+                target_pkg.clone(),
+                pick(&["memory"], 1000),
+            )),
             // CPU temp from thermal_zone (when accessible — many OEMs lock
             // /sys for shell). Battery temp + level from dumpsys (universal).
-            Box::new(AndroidTempSampler::new(device_id)),
-            Box::new(AndroidBatterySampler::new(device_id)),
+            Box::new(AndroidTempSampler::new(
+                device_id,
+                pick(&["temperature"], 2000),
+            )),
+            // BatterySampler has no dedicated chart-card today (battery
+            // temp piggy-backs on the Temperature card); follow its
+            // hardcoded default until a real Battery card lands.
+            Box::new(AndroidBatterySampler::new(device_id, 2000)),
             // GPU is best-effort: Adreno KGSL or Mali devfreq. Auto-stops
             // emitting after 3 empty polls if /sys access is locked.
-            Box::new(AndroidGpuSampler::new(device_id)),
+            Box::new(AndroidGpuSampler::new(
+                device_id,
+                pick(&["gpu"], 1000),
+            )),
         ],
         Platform::Ios => vec![
-            Box::new(IosCpuSampler::new(device_id, target_pkg.clone())),
-            Box::new(IosGraphicsSampler::new(device_id)),
+            // iOS sysmontap is one channel producing cpu_total /
+            // cpu_app / per-core / app-mem / system-mem. All three
+            // chart-cards backed by it share its cadence — we pick
+            // the min so each card's view rate is honoured.
+            Box::new(IosCpuSampler::new(
+                device_id,
+                target_pkg.clone(),
+                pick(&["cpu_usage", "cpu_core", "memory"], 1000) as u32,
+            )),
+            // graphics.opengl channel produces the Tiler/Renderer/
+            // Device GPU triplet plus CoreAnimation FPS — frame and
+            // gpu cards share its cadence.
+            Box::new(IosGraphicsSampler::new(
+                device_id,
+                pick(&["gpu", "frame"], 1000) as u32,
+            )),
             // No iOS battery sampler: lockdown queries return empty while
             // our CoreDeviceProxy DTX tunnel is held (iOS 17+ behavior).
             // The proper fix is to use Instruments DTX power services on
