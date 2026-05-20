@@ -71,6 +71,117 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+use std::collections::BTreeMap;
+
+type SignpostKey = (String, String, String); // subsystem, category, name
+type SignpostAgg = BTreeMap<SignpostKey, (u32, u32, u32)>; // (begin, end, event)
+
+/// First few app-related (UpdateSequence/Commit) signpost rows: time
+/// bytes + event-type + pid (for filtering NEW vs OLD Runner).
+#[derive(Debug, Default)]
+struct AppFramesLog {
+    rows: Vec<FrameRow>,
+}
+
+#[derive(Debug, Clone)]
+struct FrameRow {
+    table: String,
+    event_type: String,
+    time_bytes: Vec<u8>,
+    name: String,
+    pid: u32,
+}
+
+fn aggregate(
+    state: &VmState,
+    signpost_agg: &mut SignpostAgg,
+    launch_keywords: &mut Vec<String>,
+    frames: &mut AppFramesLog,
+) {
+    let get = |row: &Row, col: &str| -> String {
+        row.fields
+            .iter()
+            .find(|(c, _)| c == col)
+            .map(|(_, v)| match v {
+                StackItem::Bytes(b) => StackItem::Bytes(b.clone()).as_cstring(),
+                _ => String::new(),
+            })
+            .unwrap_or_default()
+    };
+    let get_bytes = |row: &Row, col: &str| -> Vec<u8> {
+        row.fields
+            .iter()
+            .find(|(c, _)| c == col)
+            .map(|(_, v)| match v {
+                StackItem::Bytes(b) => b.clone(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default()
+    };
+    for row in &state.rows {
+        match row.table_name.as_str() {
+            "os-signpost" => {
+                let key = (get(row, "subsystem"), get(row, "category"), get(row, "name"));
+                let et = get(row, "event-type");
+                let proc_path = get(row, "process-image-path");
+                let entry = signpost_agg.entry(key.clone()).or_insert((0, 0, 0));
+                match et.as_str() {
+                    "Begin" => entry.0 += 1,
+                    "End" => entry.1 += 1,
+                    _ => entry.2 += 1,
+                }
+                // Capture up to 10000 UpdateSequence/Commit signposts
+                // from any process (filter by pid later).
+                if frames.rows.len() < 10000
+                    && (key.2 == "UpdateSequence" || key.2 == "Commit")
+                {
+                    let _ = proc_path;
+                    // Process column is a Group of (pid_bytes, name_bytes).
+                    // Decode the pid as little-endian u32 (pad to 4 bytes).
+                    let pid = row
+                        .fields
+                        .iter()
+                        .find(|(c, _)| c == "process")
+                        .and_then(|(_, v)| match v {
+                            StackItem::Group(items) => items.first().map(|it| {
+                                let b = match it {
+                                    StackItem::Bytes(b) => b.clone(),
+                                    _ => Vec::new(),
+                                };
+                                let mut padded = [0u8; 4];
+                                let n = b.len().min(4);
+                                padded[..n].copy_from_slice(&b[..n]);
+                                u32::from_le_bytes(padded)
+                            }),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    frames.rows.push(FrameRow {
+                        table: row.table_name.clone(),
+                        event_type: et.clone(),
+                        time_bytes: get_bytes(row, "time"),
+                        name: key.2.clone(),
+                        pid,
+                    });
+                }
+            }
+            "os-log" => {
+                let fmt = get(row, "format-string");
+                if launch_keywords.len() < 32
+                    && (fmt.to_lowercase().contains("launch")
+                        || fmt.to_lowercase().contains("first frame")
+                        || fmt.to_lowercase().contains("scene")
+                        || fmt.to_lowercase().contains("didfinish"))
+                {
+                    let subsys = get(row, "subsystem");
+                    launch_keywords.push(format!("{}|{}|{}", subsys, fmt.chars().take(80).collect::<String>(), get(row, "process-image-path").chars().take(50).collect::<String>()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// One spike iteration: open activitytracetap, setConfig + start, then
 /// open a separate processcontrol transport and launch the app, then
 /// read payloads off activitytracetap for ~5s and dump them.
@@ -89,6 +200,13 @@ async fn run_one(udid: &str, bundle_id: &str) -> Result<u64> {
     // -- Launch app on separate transport so we don't interleave with
     // -- the event stream we're trying to drain.
     let mut remote_pc = build_dtx_remote(udid).await?;
+    let (mti_mach, mti_numer, mti_denom) = fetch_mach_time_info(&mut remote_pc).await?;
+    tracing::info!(
+        mti_mach,
+        mti_numer,
+        mti_denom,
+        "mti anchored (before launch)"
+    );
     let mut pc = ProcessControlClient::new(&mut remote_pc).await?;
     let pid = pc
         .launch_app(
@@ -103,11 +221,14 @@ async fn run_one(udid: &str, bundle_id: &str) -> Result<u64> {
     tracing::info!(pid, "activitytrace: launch_app returned, draining 5s of payloads");
 
     // -- Drain payloads for 5s and dump them --
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut payload_count: u64 = 0;
     let mut bplist_count: u64 = 0;
     let mut event_blob_count: u64 = 0;
     let mut total_event_bytes: u64 = 0;
+    let mut signpost_agg: SignpostAgg = BTreeMap::new();
+    let mut launch_keywords: Vec<String> = Vec::new();
+    let mut frames = AppFramesLog::default();
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remaining, read_payload(&mut stream)).await {
@@ -125,19 +246,8 @@ async fn run_one(udid: &str, bundle_id: &str) -> Result<u64> {
                 } else {
                     event_blob_count += 1;
                     total_event_bytes += payload.len() as u64;
-                    let preview = payload
-                        .iter()
-                        .take(64)
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    tracing::info!(
-                        bytes_len = payload.len(),
-                        first64_hex = %preview,
-                        "payload: event blob"
-                    );
-                    // Try to decode a few opcodes for visibility
-                    decode_first_opcodes(&payload);
+                    let state = decode_event_blob(&payload);
+                    aggregate(&state, &mut signpost_agg, &mut launch_keywords, &mut frames);
                 }
             }
             Ok(Err(e)) => {
@@ -152,8 +262,109 @@ async fn run_one(udid: &str, bundle_id: &str) -> Result<u64> {
         bplist_count,
         event_blob_count,
         total_event_bytes,
+        n_signpost_groups = signpost_agg.len(),
+        n_launch_logs = launch_keywords.len(),
         "drain done"
     );
+    // Print aggregated signpost groups (sorted, all of them).
+    for ((subsys, cat, name), (begin, end, event)) in &signpost_agg {
+        tracing::info!(
+            subsystem = %subsys,
+            category = %cat,
+            name = %name,
+            begin,
+            end,
+            event,
+            "signpost"
+        );
+    }
+    // Print launch-keyword os_log entries.
+    for k in &launch_keywords {
+        tracing::info!(log = %k, "launch-keyword log");
+    }
+    // ---- Compute candidate launch durations ----
+    // time bytes are 6-byte little-endian mach_continuous_time ticks.
+    // Decode each row's ts, filter to ones past mti, find the first
+    // UpdateSequence Begin (= "first frame starts updating") and the
+    // first Commit End (= "first frame committed to compositor").
+    let decode_ts = |b: &[u8]| -> u64 {
+        let mut buf = [0u8; 8];
+        let n = b.len().min(8);
+        buf[..n].copy_from_slice(&b[..n]);
+        u64::from_le_bytes(buf)
+    };
+    let to_ms = |ticks_delta: u64| -> u64 {
+        (ticks_delta as u128 * mti_numer as u128 / mti_denom as u128 / 1_000_000) as u64
+    };
+    let target_pid: u32 = pid as u32;
+    let mut first_update_begin: Option<u64> = None;
+    let mut first_commit_end: Option<u64> = None;
+    let mut first_update_end: Option<u64> = None;
+    let mut n_post_mti_target_pid: u32 = 0;
+    let mut all_runner_pids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for fr in &frames.rows {
+        all_runner_pids.insert(fr.pid);
+        if fr.pid != target_pid {
+            continue;
+        }
+        let ts = decode_ts(&fr.time_bytes);
+        if ts <= mti_mach {
+            continue;
+        }
+        n_post_mti_target_pid += 1;
+        if fr.name == "UpdateSequence" && fr.event_type == "Begin" && first_update_begin.is_none() {
+            first_update_begin = Some(ts);
+        }
+        if fr.name == "UpdateSequence" && fr.event_type == "End" && first_update_end.is_none() {
+            first_update_end = Some(ts);
+        }
+        if fr.name == "Commit" && fr.event_type == "End" && first_commit_end.is_none() {
+            first_commit_end = Some(ts);
+        }
+    }
+    tracing::info!(
+        target_pid,
+        ?all_runner_pids,
+        n_post_mti_target_pid,
+        "pid analysis"
+    );
+    let delta_ms = |t: Option<u64>| t.map(|ts| to_ms(ts - mti_mach));
+    tracing::info!(
+        first_update_begin_ms = ?delta_ms(first_update_begin),
+        first_update_end_ms = ?delta_ms(first_update_end),
+        first_commit_end_ms = ?delta_ms(first_commit_end),
+        "candidate launch durations"
+    );
+
+    // Show all Runner frame ts relative to mti (signed) so we can see
+    // whether they're pre- or post-launch on the device clock.
+    tracing::info!(n_frames = frames.rows.len(), "captured Runner frames");
+    // Print only post-mti rows (filter out pre-launch noise)
+    for (idx, fr) in frames.rows.iter().enumerate() {
+        let table = &fr.table;
+        let et = &fr.event_type;
+        let time_bytes = &fr.time_bytes;
+        let name = &fr.name;
+        let row_pid = fr.pid;
+        let ts_check = decode_ts(time_bytes);
+        if ts_check <= mti_mach { continue; }
+        if row_pid != target_pid { continue; }
+        let ts = decode_ts(time_bytes);
+        let signed_delta_ticks: i128 = ts as i128 - mti_mach as i128;
+        let signed_delta_ms: i128 =
+            signed_delta_ticks * mti_numer as i128 / mti_denom as i128 / 1_000_000;
+        tracing::info!(
+            idx,
+            table = %table,
+            et = %et,
+            name = %name,
+            pid = row_pid,
+            ts,
+            mti = mti_mach,
+            signed_delta_ms = signed_delta_ms as i64,
+            "frame row (post-mti)"
+        );
+    }
 
     // -- Send stop, close --
     let _ = send_stop(&mut stream, ch).await;
@@ -220,11 +431,11 @@ async fn mount_channel(stream: &mut Box<dyn ReadWrite>, identifier: &str) -> Res
 async fn send_set_config(stream: &mut Box<dyn ReadWrite>, channel: i32) -> Result<()> {
     // Verbatim from pymobiledevice3 activity_trace_tap.py
     let mut cfg = Dictionary::new();
-    cfg.insert("bm".into(), Value::Integer(0i64.into()));
+    cfg.insert("bm".into(), Value::Integer(1i64.into()));
     cfg.insert("combineDataScope".into(), Value::Integer(0i64.into()));
     cfg.insert("machTimebaseDenom".into(), Value::Integer(3i64.into()));
     cfg.insert("machTimebaseNumer".into(), Value::Integer(125i64.into()));
-    cfg.insert("onlySignposts".into(), Value::Integer(0i64.into()));
+    cfg.insert("onlySignposts".into(), Value::Integer(1i64.into()));
     cfg.insert("pidToInjectCombineDYLIB".into(), Value::String("-1".into()));
     cfg.insert(
         "predicate".into(),
@@ -332,6 +543,35 @@ async fn build_dtx_remote(udid: &str) -> Result<RemoteServerClient<Box<dyn ReadW
     Ok(RemoteServerClient::new(stream))
 }
 
+async fn fetch_mach_time_info(
+    remote: &mut RemoteServerClient<Box<dyn ReadWrite>>,
+) -> Result<(u64, u32, u32)> {
+    let mut ch = remote
+        .make_channel("com.apple.instruments.server.services.deviceinfo".to_string())
+        .await
+        .context("mount deviceinfo")?;
+    ch.call_method(
+        Some(Value::String("machTimeInfo".into())),
+        None::<Vec<AuxValue>>,
+        true,
+    )
+    .await
+    .context("call machTimeInfo")?;
+    let msg = ch.read_message().await.context("read machTimeInfo reply")?;
+    let data = msg.data.ok_or_else(|| anyhow!("machTimeInfo: empty reply"))?;
+    let arr = data
+        .as_array()
+        .ok_or_else(|| anyhow!("not array: {data:?}"))?;
+    let to_u = |v: &Value| match v {
+        Value::Integer(i) => i.as_unsigned(),
+        _ => None,
+    };
+    let mach = arr.first().and_then(to_u).ok_or_else(|| anyhow!("[0]"))?;
+    let numer = arr.get(1).and_then(to_u).ok_or_else(|| anyhow!("[1]"))? as u32;
+    let denom = arr.get(2).and_then(to_u).ok_or_else(|| anyhow!("[2]"))? as u32;
+    Ok((mach, numer, denom))
+}
+
 // -----------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------
@@ -370,35 +610,246 @@ fn scan_bplist_strings(bytes: &[u8]) -> Vec<String> {
     out
 }
 
-/// Best-effort: decode the first few opcodes of an event blob. Stack-VM
-/// per pymobiledevice3 docs; for the spike we just print recognized
-/// opcodes / push terminator words. The point is to see "something
-/// structurally plausible" — full decoder lives in the real client.
-fn decode_first_opcodes(bytes: &[u8]) {
-    let mut events: Vec<String> = Vec::new();
-    let mut i = 0;
-    let mut steps = 0;
-    while i + 2 <= bytes.len() && steps < 24 {
-        let w = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
-        let high = w >> 8;
-        let low = w & 0xff;
-        let kind = match (w >> 14, high) {
-            (_, 0x01) => format!("CMD_DEFINE_TABLE(low=0x{low:02x})"),
-            (_, 0x02) => format!("CMD_END_ROW(low=0x{low:02x})"),
-            (_, 0x05) => format!("CMD_CONVERT_MACH_CONTINUOUS"),
-            (_, 0x64) => format!("CMD_TABLE_RESET(low=0x{low:02x})"),
-            (_, 0x65) => format!("CMD_COPY(low=0x{low:02x})"),
-            (_, 0x68) => format!("CMD_SENTINEL"),
-            (_, 0x69) => format!("CMD_STRUCT(low=0x{low:02x})"),
-            (_, 0x6A) => format!("CMD_PLACEHOLDER_COUNT(low=0x{low:02x})"),
-            (_, 0x6B) => format!("CMD_DEBUG"),
-            (0b10, _) => format!("PUSH_continue(low=0x{low:02x})"),
-            (0b11, _) => format!("PUSH_terminate(low=0x{low:02x})"),
-            _ => format!("UNKNOWN(0x{w:04x})"),
-        };
-        events.push(kind);
-        i += 2;
-        steps += 1;
+/// Stack-VM decoder. Mirrors pymobiledevice3's `_parse` /
+/// `_handle_*` logic, but in idiomatic Rust. Yields `Row`s with
+/// named columns according to the device's runtime-defined tables.
+#[derive(Debug, Clone)]
+struct Table {
+    name: String,
+    columns: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+enum StackItem {
+    Bytes(Vec<u8>),
+    Sentinel,
+    Group(Vec<StackItem>),
+}
+
+impl StackItem {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            StackItem::Bytes(b) => b,
+            _ => &[],
+        }
     }
-    tracing::info!(?events, "opcode preview");
+    fn as_cstring(&self) -> String {
+        let b = self.as_bytes();
+        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        String::from_utf8_lossy(&b[..end]).to_string()
+    }
+}
+
+#[derive(Debug, Default)]
+struct VmState {
+    tables: Vec<Table>,
+    stack: Vec<StackItem>,
+    rows: Vec<Row>,
+}
+
+#[derive(Debug, Clone)]
+struct Row {
+    table_name: String,
+    fields: Vec<(String, StackItem)>,
+}
+
+fn decode_event_blob(bytes: &[u8]) -> VmState {
+    let mut state = VmState::default();
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        let w = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        i += 2;
+        let high = (w >> 8) as u8;
+        let low = (w & 0xff) as u8;
+        match high {
+            0x01 => handle_define_table(&mut state, low),
+            0x02 => handle_end_row(&mut state, low),
+            0x05 => {} // CONVERT_MACH_CONTINUOUS — host no-op
+            0x64 => {
+                // TABLE_RESET — bump generation, clear stack
+                state.stack.clear();
+            }
+            0x65 => {
+                // COPY(distance) — pymobiledevice3: `stack[-distance - 1]`
+                // i.e. distance is 0-indexed from top. distance==0 copies
+                // the top of stack. We skip the special 0xFF (long-struct)
+                // path for now.
+                let d = low as usize;
+                if low != 0xFF && state.stack.len() > d {
+                    let item = state.stack[state.stack.len() - d - 1].clone();
+                    state.stack.push(item);
+                }
+            }
+            0x68 => state.stack.push(StackItem::Sentinel),
+            0x69 => {
+                // STRUCT(distance) — group last `distance` items
+                let d = low as usize;
+                if d <= state.stack.len() {
+                    let n = state.stack.len();
+                    let group: Vec<StackItem> = state.stack.drain(n - d..).collect();
+                    state.stack.push(StackItem::Group(group));
+                }
+            }
+            0x6A => {
+                // PLACEHOLDER_COUNT(count) — drop last `count` items
+                let n = low as usize;
+                if n <= state.stack.len() {
+                    let len = state.stack.len();
+                    state.stack.truncate(len - n);
+                }
+            }
+            0x6B => {
+                // DEBUG — pop + sanity check; we just pop
+                state.stack.pop();
+            }
+            _ => {
+                // Push — accumulate 14-bit words until terminator
+                i = handle_push(&mut state, w, bytes, i);
+            }
+        }
+    }
+    state
+}
+
+fn handle_push(state: &mut VmState, mut word: u16, bytes: &[u8], mut i: usize) -> usize {
+    // Build bit stream into Vec<u8> MSB-first (matches pymobiledevice3's
+    // `imm.to_bytes(..., "big")` semantics for arbitrarily-long pushes
+    // — using u128 panics with shift overflow on strings > 16 bytes).
+    let mut bit_buf: Vec<u8> = Vec::new();
+    let mut bit_pos: usize = 0;
+    loop {
+        let top = word >> 14;
+        let data14: u16 = word & 0x3FFF;
+        // Append 14 bits of data14 to bit_buf, MSB-first
+        for bit_i in (0..14).rev() {
+            let bit = ((data14 >> bit_i) & 1) as u8;
+            let byte_idx = bit_pos / 8;
+            let bit_in_byte = 7 - (bit_pos % 8);
+            if byte_idx >= bit_buf.len() {
+                bit_buf.push(0);
+            }
+            bit_buf[byte_idx] |= bit << bit_in_byte;
+            bit_pos += 1;
+        }
+        if top == 0b11 {
+            break;
+        }
+        if i + 2 > bytes.len() {
+            break;
+        }
+        word = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+        i += 2;
+    }
+    // bit_pos is the actual data-bit count. Final byte already has
+    // trailing zero bits — i.e. left-aligned. That matches python's
+    // `imm <<= 8 - bit_count % 8` then to_bytes("big") behaviour.
+    state.stack.push(StackItem::Bytes(bit_buf));
+    i
+}
+
+fn handle_define_table(state: &mut VmState, _low: u8) {
+    // Pop the last 4 items: (unknown0, unknown2, name, columns)
+    // pymobiledevice3 does `Table(*self.stack[-distance:])` with distance=4.
+    if state.stack.len() < 4 {
+        return;
+    }
+    let n = state.stack.len();
+    let parts: Vec<StackItem> = state.stack.drain(n - 4..).collect();
+    // parts[0] = unknown0, parts[1] = unknown2, parts[2] = name, parts[3] = columns
+    let name = parts[2].as_cstring();
+    let columns: Vec<String> = match &parts[3] {
+        StackItem::Group(items) => items.iter().map(|i| i.as_cstring()).collect(),
+        StackItem::Bytes(b) => {
+            // Single column? Treat as one.
+            let s = StackItem::Bytes(b.clone()).as_cstring();
+            vec![s]
+        }
+        _ => Vec::new(),
+    };
+    state.tables.push(Table { name, columns });
+}
+
+fn handle_end_row(state: &mut VmState, table_idx: u8) {
+    let table = match state.tables.get(table_idx as usize) {
+        Some(t) => t.clone(),
+        None => return,
+    };
+    let ncols = table.columns.len();
+    if state.stack.len() < ncols {
+        return;
+    }
+    let n = state.stack.len();
+    let popped: Vec<StackItem> = state.stack.drain(n - ncols..).collect();
+    let fields: Vec<(String, StackItem)> = table
+        .columns
+        .iter()
+        .zip(popped.into_iter())
+        .map(|(c, v)| (c.clone(), v))
+        .collect();
+    state.rows.push(Row {
+        table_name: table.name,
+        fields,
+    });
+}
+
+fn print_decoded(blob_idx: usize, bytes: &[u8]) {
+    let state = decode_event_blob(bytes);
+    let table_names: Vec<&str> = state.tables.iter().map(|t| t.name.as_str()).collect();
+    let columns_per_table: Vec<String> = state
+        .tables
+        .iter()
+        .map(|t| format!("{}={:?}", t.name, t.columns))
+        .collect();
+    tracing::info!(
+        blob_idx,
+        n_tables = state.tables.len(),
+        n_rows = state.rows.len(),
+        ?table_names,
+        "decode summary"
+    );
+    if !columns_per_table.is_empty() {
+        tracing::info!(?columns_per_table, "table schemas");
+    }
+    // Group signposts by (subsystem, category, name) so we can spot
+    // the launch-related ones quickly.
+    use std::collections::BTreeMap;
+    let mut signpost_summary: BTreeMap<(String, String, String), (u32, u32)> = BTreeMap::new(); // (begin, end)
+    for row in &state.rows {
+        if !row.table_name.starts_with("os-signpost") {
+            continue;
+        }
+        let get = |col: &str| -> String {
+            row.fields
+                .iter()
+                .find(|(c, _)| c == col)
+                .map(|(_, v)| match v {
+                    StackItem::Bytes(b) => StackItem::Bytes(b.clone()).as_cstring(),
+                    _ => String::new(),
+                })
+                .unwrap_or_default()
+        };
+        let subsystem = get("subsystem");
+        let category = get("category");
+        let name = get("name");
+        let event_type = get("event-type");
+        let key = (subsystem, category, name);
+        let entry = signpost_summary.entry(key).or_insert((0, 0));
+        if event_type == "Begin" {
+            entry.0 += 1;
+        } else if event_type == "End" {
+            entry.1 += 1;
+        } else {
+            // Event-type may also be "Event" (no scope)
+        }
+    }
+    for ((subsys, cat, name), (begins, ends)) in &signpost_summary {
+        tracing::info!(
+            subsystem = %subsys,
+            category = %cat,
+            name = %name,
+            begins,
+            ends,
+            "signpost group"
+        );
+    }
 }
