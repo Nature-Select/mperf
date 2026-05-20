@@ -19,16 +19,21 @@ use smallvec::smallvec;
 use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 
-const PERIOD_MS: u64 = 3000;
+const MIN_INTERVAL_MS: u64 = 500;
+pub const DEFAULT_INTERVAL_MS: u64 = 3000;
 const DOMAIN: &str = "com.apple.mobile.battery";
 
 pub struct BatterySampler {
     udid: String,
+    interval_ms: u64,
 }
 
 impl BatterySampler {
-    pub fn new(udid: impl Into<String>) -> Self {
-        Self { udid: udid.into() }
+    pub fn new(udid: impl Into<String>, interval_ms: u64) -> Self {
+        Self {
+            udid: udid.into(),
+            interval_ms: interval_ms.max(MIN_INTERVAL_MS),
+        }
     }
 }
 
@@ -39,7 +44,7 @@ impl Sampler for BatterySampler {
     }
 
     fn target_hz(&self) -> f32 {
-        1.0 / 3.0
+        1000.0 / self.interval_ms as f32
     }
 
     async fn start(
@@ -50,9 +55,10 @@ impl Sampler for BatterySampler {
         let _provider = connect::provider_for(&self.udid).await.map_err(map_setup)?;
 
         let udid = self.udid.clone();
+        let interval_ms = self.interval_ms;
         let clock = ctx.clock.clone();
         let s = stream! {
-            let mut ticker = interval(Duration::from_millis(PERIOD_MS));
+            let mut ticker = interval(Duration::from_millis(interval_ms));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             ticker.tick().await; // skip immediate
             let mut warned_no_temp = false;

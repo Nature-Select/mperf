@@ -26,7 +26,8 @@ use smallvec::smallvec;
 use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 
-const PERIOD_MS: u64 = 1000;
+const MIN_INTERVAL_MS: u64 = 200;
+pub const DEFAULT_INTERVAL_MS: u64 = 1000;
 
 /// Probe each candidate path with an individual `ls -1d` (semicolon-chained,
 /// no `for` loops or `$()` — Samsung toybox hangs on those). Each `ls`
@@ -69,11 +70,15 @@ enum Source {
 
 pub struct GpuSampler {
     serial: String,
+    interval_ms: u64,
 }
 
 impl GpuSampler {
-    pub fn new(serial: impl Into<String>) -> Self {
-        Self { serial: serial.into() }
+    pub fn new(serial: impl Into<String>, interval_ms: u64) -> Self {
+        Self {
+            serial: serial.into(),
+            interval_ms: interval_ms.max(MIN_INTERVAL_MS),
+        }
     }
 }
 
@@ -84,7 +89,7 @@ impl Sampler for GpuSampler {
     }
 
     fn target_hz(&self) -> f32 {
-        1.0
+        1000.0 / self.interval_ms as f32
     }
 
     async fn start(
@@ -92,6 +97,7 @@ impl Sampler for GpuSampler {
         ctx: SamplerCtx,
     ) -> Result<BoxStream<'static, Result<Sample, SamplerError>>, SamplerError> {
         let serial = self.serial.clone();
+        let interval_ms = self.interval_ms;
         let clock = ctx.clock.clone();
 
         // ---- One-time discovery up-front ----
@@ -126,7 +132,7 @@ impl Sampler for GpuSampler {
         );
 
         let s = stream! {
-            let mut ticker = interval(Duration::from_millis(PERIOD_MS));
+            let mut ticker = interval(Duration::from_millis(interval_ms));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             ticker.tick().await; // skip immediate
 

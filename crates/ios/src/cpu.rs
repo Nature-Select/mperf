@@ -25,20 +25,29 @@ use idevice::{
 use mperf_schema::{LabelKey, MetricKind, Sample, Sampler, SamplerCtx, SamplerError};
 use smallvec::smallvec;
 
-const INTERVAL_MS: u32 = 1000;
+const MIN_INTERVAL_MS: u32 = 200;
+pub const DEFAULT_INTERVAL_MS: u32 = 1000;
 
 pub struct CpuSampler {
     udid: String,
     /// Bundle id to track per-app CPU% and memory for. Mandatory —
     /// PerfDog-style explicit selection; no foreground heuristic.
     target_pkg: String,
+    /// sysmontap channel cadence (ms). Lower bound clamped to
+    /// `MIN_INTERVAL_MS` — DTX jitter dominates below ~200ms anyway.
+    interval_ms: u32,
 }
 
 impl CpuSampler {
-    pub fn new(udid: impl Into<String>, target_pkg: impl Into<String>) -> Self {
+    pub fn new(
+        udid: impl Into<String>,
+        target_pkg: impl Into<String>,
+        interval_ms: u32,
+    ) -> Self {
         Self {
             udid: udid.into(),
             target_pkg: target_pkg.into(),
+            interval_ms: interval_ms.max(MIN_INTERVAL_MS),
         }
     }
 }
@@ -50,7 +59,7 @@ impl Sampler for CpuSampler {
     }
 
     fn target_hz(&self) -> f32 {
-        1.0
+        1000.0 / self.interval_ms as f32
     }
 
     async fn start(
@@ -63,6 +72,7 @@ impl Sampler for CpuSampler {
 
         let udid = self.udid.clone();
         let target_pkg = self.target_pkg.clone();
+        let interval_ms = self.interval_ms;
         // Resolve bundle_id → CFBundleExecutable up-front. One install_proxy
         // round-trip; cached for the session. If the app got uninstalled
         // between selection and Start we still proceed with system-only
@@ -249,7 +259,7 @@ impl Sampler for CpuSampler {
             tracing::info!(sampler = "ios.cpu", "set_config");
             if let Err(e) = sysmontap
                 .set_config(&SysmontapConfig {
-                    interval_ms: INTERVAL_MS,
+                    interval_ms,
                     process_attributes: proc_attrs,
                     system_attributes: sys_attrs,
                 })
