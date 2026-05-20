@@ -113,8 +113,20 @@ export function startSession(
   platform: Platform,
   targetPkg: string,
   deviceModel?: string,
+  /// Metric ids the user has selected in the picker at the moment Start
+  /// was clicked. Persisted with the session; the History view of this
+  /// session will use it to gate which chart cards render. `undefined`
+  /// (and an empty array) is treated as "show every captured metric"
+  /// by the backend — same fallback path older sessions take.
+  selectedMetrics?: string[],
 ): Promise<number> {
-  return invoke<number>('start_session', { deviceId, platform, deviceModel, targetPkg })
+  return invoke<number>('start_session', {
+    deviceId,
+    platform,
+    deviceModel,
+    targetPkg,
+    selectedMetrics,
+  })
 }
 
 export interface AppInfo {
@@ -157,6 +169,11 @@ export interface SessionInfo {
   device_platform: string
   device_model: string | null
   app_bundle_id: string | null
+  /// Snapshot of the metrics-picker selection at recording start.
+  /// `null` on pre-v5 sessions and on any session whose caller didn't
+  /// supply a selection — both are rendered as "show every metric this
+  /// session has data for" by the History view.
+  selected_metrics: string[] | null
 }
 
 export interface SamplePoint {

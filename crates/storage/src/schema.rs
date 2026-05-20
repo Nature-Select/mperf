@@ -15,7 +15,7 @@ use rusqlite::{params, Connection};
 /// Highest schema version known to this build. Surfaced via the
 /// Settings tab so users can sanity-check the on-disk DB after a
 /// migration.
-pub const HEAD: i32 = 4;
+pub const HEAD: i32 = 5;
 
 pub fn run_migrations(c: &mut Connection) -> rusqlite::Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")?;
@@ -130,5 +130,14 @@ const MIGRATIONS: &[(i32, &str)] = &[
         );
         CREATE INDEX idx_markers_session ON markers(session_id, ts_us);
         ",
+    ),
+    (
+        5,
+        // JSON-encoded array of metric ids the user had selected in the
+        // picker at recording time. NULL on pre-5 rows (and on any row
+        // recorded by a build that doesn't pass selection) — the
+        // frontend reads NULL as "show every metric this session has
+        // data for", preserving the old default-show-all behaviour.
+        "ALTER TABLE sessions ADD COLUMN selected_metrics TEXT;",
     ),
 ];

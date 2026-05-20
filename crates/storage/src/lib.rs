@@ -73,14 +73,23 @@ impl Storage {
 
     /// Create a new session row. Returns the auto-assigned id.
     pub async fn create_session(&self, meta: SessionMeta) -> Result<i64> {
+        // `selected_metrics` is stored as a JSON-encoded TEXT column so
+        // the SQL schema doesn't need a separate join table. The list
+        // is small (≤ 30 ids) and read once at session-detail open, so
+        // JSON serialisation cost is negligible.
+        let selected_json = meta
+            .selected_metrics
+            .as_ref()
+            .map(|v| serde_json::to_string(v).expect("Vec<String> serialises"));
         let id = self
             .conn
             .call(move |c| {
                 c.execute(
                     "INSERT INTO sessions (
                         wall_start_ms, device_id, device_platform,
-                        device_model, app_bundle_id, meta_json
-                    ) VALUES (?, ?, ?, ?, ?, ?)",
+                        device_model, app_bundle_id, meta_json,
+                        selected_metrics
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     params![
                         meta.wall_start_ms,
                         meta.device_id,
@@ -88,6 +97,7 @@ impl Storage {
                         meta.device_model,
                         meta.app_bundle_id,
                         meta.meta_json,
+                        selected_json,
                     ],
                 )?;
                 Ok(c.last_insert_rowid())
@@ -175,10 +185,11 @@ impl Storage {
             .call(|c| {
                 let mut stmt = c.prepare(
                     "SELECT id, wall_start_ms, wall_end_ms, device_id, device_platform,
-                            device_model, app_bundle_id
+                            device_model, app_bundle_id, selected_metrics
                      FROM sessions ORDER BY wall_start_ms DESC",
                 )?;
                 let it = stmt.query_map([], |row| {
+                    let selected_json: Option<String> = row.get(7)?;
                     Ok(SessionInfo {
                         id: row.get(0)?,
                         wall_start_ms: row.get(1)?,
@@ -187,6 +198,7 @@ impl Storage {
                         device_platform: row.get(4)?,
                         device_model: row.get(5)?,
                         app_bundle_id: row.get(6)?,
+                        selected_metrics: parse_selected_metrics(selected_json),
                     })
                 })?;
                 let mut out = Vec::new();
@@ -206,10 +218,11 @@ impl Storage {
             .call(move |c| {
                 c.query_row(
                     "SELECT id, wall_start_ms, wall_end_ms, device_id, device_platform,
-                            device_model, app_bundle_id
+                            device_model, app_bundle_id, selected_metrics
                      FROM sessions WHERE id = ?",
                     params![id],
                     |row| {
+                        let selected_json: Option<String> = row.get(7)?;
                         Ok(SessionInfo {
                             id: row.get(0)?,
                             wall_start_ms: row.get(1)?,
@@ -218,6 +231,7 @@ impl Storage {
                             device_platform: row.get(4)?,
                             device_model: row.get(5)?,
                             app_bundle_id: row.get(6)?,
+                            selected_metrics: parse_selected_metrics(selected_json),
                         })
                     },
                 )
@@ -418,6 +432,22 @@ const LONG_INSERT: &str = "
     INSERT INTO samples_long (session_id, ts_us, kind, label_key, label_value, value)
     VALUES (?, ?, ?, ?, ?, ?)
 ";
+
+/// Decode the JSON-encoded `selected_metrics` column. A row written
+/// pre-migration-5 returns `None` (the column is NULL); a row whose
+/// JSON is corrupt also returns `None` with a warning rather than
+/// surfacing the error — losing the snapshot just degrades to
+/// "show all metrics that have data", which is the legacy default.
+fn parse_selected_metrics(raw: Option<String>) -> Option<Vec<String>> {
+    let s = raw?;
+    match serde_json::from_str::<Vec<String>>(&s) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(error = %e, raw = %s, "selected_metrics JSON parse failed; treating as 'show all'");
+            None
+        }
+    }
+}
 
 /// Returns the wide-table column name for an unlabeled metric, or None
 /// if the metric has no dedicated column (and should go to samples_long).
