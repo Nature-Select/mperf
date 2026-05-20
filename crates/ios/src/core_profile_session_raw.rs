@@ -344,12 +344,14 @@ impl CoreProfileSessionRaw {
         let _ = self
             .send_message(ch, msg_id, Some("stop"), None, false)
             .await;
-        // Drain & discard whatever the device pushes for 800ms so
-        // kperf is fully shut down on the device side before we
-        // close the socket. Without this, a second cold-start
-        // measurement on the same device hits "kperf already owned"
-        // (silent) and the kdebug stream never resumes.
-        let drain_deadline = std::time::Instant::now() + Duration::from_millis(800);
+        // Drain & discard whatever the device pushes for 2s so kperf
+        // is fully shut down on the device side before we close the
+        // socket. Without this, a second cold-start measurement
+        // within ~2-3s hits "_lockKPerf: could not lock kperf"
+        // (DTTapStatusMessage notice). 2s clears it on iOS 26.4.2
+        // on an iPhone 14; if not enough, surface as an error from
+        // the next attempt instead of waiting 5s.
+        let drain_deadline = std::time::Instant::now() + Duration::from_millis(2000);
         loop {
             let remaining = drain_deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -451,6 +453,20 @@ impl CoreProfileSessionRaw {
                     }
                     None => {
                         let strs = scan_bplist_strings(&bytes);
+                        // The device sometimes pushes a DTTapStatusMessage
+                        // saying kperf can't be locked because it's still
+                        // owned by the previous session. Surface that as a
+                        // dedicated error instead of waiting 5s for events
+                        // that will never come.
+                        if let Some(notice) = strs
+                            .iter()
+                            .find(|s| s.contains("kperf") || s.contains("Failed to start"))
+                        {
+                            return Err(anyhow!(
+                                "coreprofile rejected setConfig: {notice} \
+                                 (wait ~3s and retry — device-side kperf release is asynchronous)"
+                            ));
+                        }
                         tracing::info!(
                             bytes_len = bytes.len(),
                             strings = ?strs,
