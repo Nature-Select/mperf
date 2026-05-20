@@ -1,24 +1,31 @@
 //! Cold / hot app-launch timing on iOS.
 //!
-//! Cold start: coreprofilesessiontap DTX channel — same kdebug stream
-//! Xcode Instruments / PerfDog tap. We subscribe to kernel-debug
-//! events, anchor t0 via deviceinfo.machTimeInfo (separate transport
-//! so kdebug pushes don't compete with the RPC reply), launch the
-//! app, then look for the `Initial Frame Rendering END` kdebug event
-//! (debug_id = 0x31C00506). This matches PerfDog's top-line "App
-//! Launch" number (~200ms on warm hardware).
+//! Cold start: coreprofilesessiontap DTX channel — same kdebug
+//! stream Xcode Instruments / PerfDog tap. We anchor t0 via
+//! deviceinfo.machTimeInfo (separate transport so kdebug pushes
+//! don't compete with the RPC reply), launch the app via
+//! processcontrol, then look for the LAST class 0x2B (UIKit)
+//! kdebug event past t0 within ~2s. On iOS 26 the
+//! py-ios-device-documented `0x31C00506` first-frame marker
+//! doesn't fire; the last UIKit event is the closest proxy and
+//! lands inside the user-perceived launch window (matched
+//! PerfDog's 213ms in testing).
+//!
+//! The coreprofilesessiontap session is held in a per-UDID pool
+//! (`core_profile_session_raw::SESSIONS`) and reused across
+//! measurements — iOS 26 doesn't reliably re-acquire kperf when
+//! we tear down and reopen the channel, so we leave it streaming
+//! and just demarcate per-measurement windows by timestamp.
 //!
 //! Hot start: RPC-only via processcontrol.launchApp. The kdebug
 //! first-frame event doesn't reliably fire on a UIScene re-attach
-//! (the path foregrounding takes); the RPC time is the closest single
-//! number we have for now.
-//!
-//! Foreground handling: same SpringBoard pre-step pattern. Without
-//! it, DTX-initiated launches on a foreground target can leave the
-//! device on a black screen.
+//! (the path foregrounding takes); the RPC time is the closest
+//! single number we have for now.
 
 use crate::connect;
-use crate::core_profile_session_raw::{CoreProfileSessionRaw, MachTimeInfo};
+use crate::core_profile_session_raw::{
+    acquire_session, invalidate_session, MachTimeInfo,
+};
 use crate::launch::launch_app_with_options;
 use anyhow::{anyhow, Context, Result};
 use idevice::{
@@ -31,7 +38,7 @@ use idevice::{
     IdeviceService, ReadWrite,
 };
 use plist::Value;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 pub struct StartupTiming {
@@ -45,21 +52,25 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
     } else {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    tracing::info!("cold start: SpringBoard prep done, opening coreprofile transport");
+    tracing::info!("cold start: SpringBoard prep done");
 
-    let mut cp = CoreProfileSessionRaw::start(udid)
-        .await
-        .context("CoreProfileSessionRaw::start")?;
-    tracing::info!("cold start: coreprofile streamer ready, opening processcontrol transport");
+    // Get-or-create the long-lived coreprofile session for this
+    // device. The session stays alive across measurements; we never
+    // explicitly stop kperf.
+    let session = acquire_session(udid).await?;
+    let mut cp = session.lock().await;
+    tracing::info!("cold start: coreprofile session acquired");
 
+    // Separate transport for machTimeInfo + processcontrol — must
+    // not interleave with the kdebug push stream on the coreprofile
+    // transport (its reply correlation would eat events otherwise).
     let mut remote_pc = build_dtx_remote(udid)
         .await
         .context("DTX session for processcontrol")?;
-    tracing::info!("cold start: pc transport open, fetching machTimeInfo");
     let mti = fetch_mach_time_info(&mut remote_pc)
         .await
         .context("machTimeInfo")?;
-    tracing::info!(?mti, "cold start: anchored mach time, building ProcessControlClient");
+    tracing::info!(?mti, "cold start: anchored mach time");
 
     let mut pc = ProcessControlClient::new(&mut remote_pc)
         .await
@@ -76,94 +87,34 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
         )
         .await
         .with_context(|| format!("processcontrol.launchApp({bundle_id})"))?;
-    tracing::info!(pid, "cold start: launch_app returned, watching kdebug stream for 0x31C00506");
+    tracing::info!(pid, "cold start: launch_app returned, watching kdebug stream");
 
-    // iOS 26 changed the UIKit kdebug codes — py-ios-device's
-    // 0x31C00506 (class 0x31, subclass 0xC0, code 1, FUNC_END) never
-    // arrives. Real launch events come through as class 0x2B /
-    // subclass 0x87 (UIKit) with new code numbers we don't yet have
-    // a phase table for.
-    //
-    // Pragmatic heuristic: collect events for up to 5s OR until the
-    // stream goes quiet for 400ms (whichever first), then take the
-    // LATEST class-0x2B event whose timestamp is past mti — that's
-    // the last UIKit lifecycle event of the launch, which lands
-    // roughly at "first frame committed". Bounded by a sanity check
-    // (timestamp within ~5s of mti, to ignore misaligned-byte
-    // garbage in pre-launch V3-header chunks).
-    let launch_wall = Instant::now();
-    let hard_deadline = launch_wall + Duration::from_secs(5);
-    // On a healthy device the FIRST real kdebug batch (the V3
-    // stackshot + schema, ~970KB) arrives within ~300ms of
-    // launch_app returning. If 1.5s pass with nothing but the
-    // initial cc/tv/tc ack, the device's kperf is in a wedged state
-    // (we observed this after one previous successful measurement
-    // in the same mperf process; the device sends no explicit
-    // notice — just silence). Bail fast so the UI shows a clear
-    // error instead of spinning for 5s.
-    let stream_alive_deadline = launch_wall + Duration::from_millis(1500);
-    let mut events_seen: u64 = 0;
-    let mut last_2b_mach: Option<u64> = None;
-    let max_ticks = (5_000_000_000u128 * mti.denom as u128 / mti.numer as u128) as u64;
-    loop {
-        let now = Instant::now();
-        if events_seen == 0 && now >= stream_alive_deadline {
-            let _ = cp.stop().await;
-            anyhow::bail!(
-                "kperf appears wedged on the device (no kdebug data 1.5s after launch). \
-                 This is a known iOS 26 issue with consecutive coreprofile sessions — \
-                 restart mperf to reset, or wait ~30s and retry"
-            );
+    let result = cp
+        .capture_post_launch_timestamp(&mti, Duration::from_secs(3))
+        .await;
+
+    // If the session reports the device is wedged, drop it from the
+    // pool — next attempt will rebuild a fresh transport. (Won't
+    // always help on iOS 26 — kperf may stay broken until mperf
+    // restarts — but at least we try.)
+    let last_ts = match result {
+        Ok(ts) => ts,
+        Err(e) => {
+            drop(cp);
+            invalidate_session(udid).await;
+            return Err(e);
         }
-        let remaining = hard_deadline.saturating_duration_since(now);
-        if remaining.is_zero() {
-            break;
-        }
-        let events = match tokio::time::timeout(
-            Duration::from_millis(400).min(remaining),
-            cp.next_events(),
-        )
-        .await
-        {
-            Ok(Ok(events)) => events,
-            Ok(Err(e)) => return Err(e),
-            Err(_) if last_2b_mach.is_some() => break,
-            Err(_) => continue,
-        };
-        events_seen += events.len() as u64;
-        for ev in &events {
-            if ev.class_code() != 0x2b {
-                continue;
-            }
-            if ev.timestamp_mach <= mti.mach_absolute_time {
-                continue;
-            }
-            let delta = ev.timestamp_mach - mti.mach_absolute_time;
-            if delta > max_ticks {
-                continue;
-            }
-            last_2b_mach =
-                Some(last_2b_mach.map_or(ev.timestamp_mach, |prev| prev.max(ev.timestamp_mach)));
-        }
-    }
-    let last_ts = last_2b_mach.ok_or_else(|| {
-        anyhow!(
-            "no UIKit kdebug events (class 0x2B) seen after launch in 5s ({events_seen} total \
-             events received) — likely a transient device-side issue, retry"
-        )
-    })?;
+    };
+
     let delta = last_ts - mti.mach_absolute_time;
     let total_ns = mti.ticks_delta_to_ns(delta);
     let total_ms = total_ns / 1_000_000;
     tracing::info!(
-        events_seen,
         delta_ticks = delta,
         total_ns,
         total_ms,
         "cold start: last UIKit event captured (proxy for first-frame)"
     );
-
-    let _ = cp.stop().await;
     Ok(StartupTiming { total_ms })
 }
 
@@ -182,7 +133,7 @@ pub async fn measure_hot_start(udid: &str, bundle_id: &str) -> Result<StartupTim
     let mut pc = ProcessControlClient::new(&mut remote_pc)
         .await
         .context("ProcessControlClient::new")?;
-    let t0 = Instant::now();
+    let t0 = std::time::Instant::now();
     let _pid = pc
         .launch_app(
             bundle_id.to_string(),
@@ -199,10 +150,8 @@ pub async fn measure_hot_start(udid: &str, bundle_id: &str) -> Result<StartupTim
 }
 
 /// Call `deviceinfo.machTimeInfo` and decode the
-/// `(mach_absolute_time, numer, denom)` tuple. Uses idevice's
-/// RemoteServerClient path because it correctly correlates the reply
-/// — we just need to bypass DeviceInfoClient (which doesn't expose
-/// this selector publicly) and call the channel directly.
+/// `(mach_absolute_time, numer, denom)` tuple via idevice's
+/// RemoteServerClient (which correctly correlates the reply).
 async fn fetch_mach_time_info(
     remote: &mut RemoteServerClient<Box<dyn ReadWrite>>,
 ) -> Result<MachTimeInfo> {
@@ -218,9 +167,7 @@ async fn fetch_mach_time_info(
     .await
     .context("call machTimeInfo")?;
     let msg = ch.read_message().await.context("read machTimeInfo reply")?;
-    let data = msg
-        .data
-        .ok_or_else(|| anyhow!("machTimeInfo: empty reply"))?;
+    let data = msg.data.ok_or_else(|| anyhow!("machTimeInfo: empty reply"))?;
     let arr = data
         .as_array()
         .ok_or_else(|| anyhow!("machTimeInfo: reply not Array: {data:?}"))?;

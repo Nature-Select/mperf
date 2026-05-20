@@ -34,8 +34,11 @@ use idevice::{
     IdeviceService, ReadWrite,
 };
 use plist::{Dictionary, Value};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 const SERVICE_CORE_PROFILE: &str = "com.apple.instruments.server.services.coreprofilesessiontap";
 const SERVICE_DTSERVICEHUB: &str = "com.apple.instruments.dtservicehub";
@@ -335,6 +338,11 @@ impl CoreProfileSessionRaw {
             .await
     }
 
+    /// Send stop + drain. Currently unused because the session pool
+    /// keeps coreprofile streaming continuously across measurements
+    /// — kept for the eventual graceful shutdown path (process
+    /// exit / device disconnect).
+    #[allow(dead_code)]
     pub async fn stop(&mut self) -> Result<()> {
         let ch = self.coreprofile_channel;
         if ch == 0 {
@@ -364,6 +372,75 @@ impl CoreProfileSessionRaw {
         }
         tracing::info!("coreprofile: stop drained");
         Ok(())
+    }
+
+    /// Capture kdebug events for up to `max_window` after the caller
+    /// dispatched a launch_app RPC. Returns the largest class-0x2B
+    /// event timestamp (in mach ticks) past `mti.mach_absolute_time`
+    /// — i.e. the last UIKit lifecycle event of the launch we just
+    /// fired.
+    ///
+    /// Designed to be called REPEATEDLY on the same session — each
+    /// call captures one launch by filtering events with timestamp >
+    /// `mti.mach_absolute_time`. The caller is responsible for
+    /// re-fetching mti right before each launch so old events from
+    /// previous measurements are excluded.
+    pub async fn capture_post_launch_timestamp(
+        &mut self,
+        mti: &MachTimeInfo,
+        max_window: Duration,
+    ) -> Result<u64> {
+        let watch_deadline = Instant::now() + max_window;
+        let stream_alive_deadline = Instant::now() + Duration::from_millis(1500);
+        let mut events_seen: u64 = 0;
+        let mut last_2b_mach: Option<u64> = None;
+        let max_ticks = (5_000_000_000u128 * mti.denom as u128 / mti.numer as u128) as u64;
+        loop {
+            let now = Instant::now();
+            if events_seen == 0 && now >= stream_alive_deadline && last_2b_mach.is_none() {
+                anyhow::bail!(
+                    "kperf appears wedged on the device (no kdebug data 1.5s after launch). \
+                     The device-side session likely needs to be reset; close mperf and reopen"
+                );
+            }
+            let remaining = watch_deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                break;
+            }
+            let events = match tokio::time::timeout(
+                Duration::from_millis(400).min(remaining),
+                self.next_events(),
+            )
+            .await
+            {
+                Ok(Ok(events)) => events,
+                Ok(Err(e)) => return Err(e),
+                Err(_) if last_2b_mach.is_some() => break,
+                Err(_) => continue,
+            };
+            events_seen += events.len() as u64;
+            for ev in &events {
+                if ev.class_code() != 0x2b {
+                    continue;
+                }
+                if ev.timestamp_mach <= mti.mach_absolute_time {
+                    continue;
+                }
+                let delta = ev.timestamp_mach - mti.mach_absolute_time;
+                if delta > max_ticks {
+                    continue;
+                }
+                last_2b_mach = Some(
+                    last_2b_mach.map_or(ev.timestamp_mach, |prev| prev.max(ev.timestamp_mach)),
+                );
+            }
+        }
+        last_2b_mach.ok_or_else(|| {
+            anyhow!(
+                "no UIKit kdebug events (class 0x2B) seen after launch in window — \
+                 ({events_seen} total events received)"
+            )
+        })
     }
 
     /// Send one outgoing DTX message. Doesn't wait for any reply.
@@ -671,6 +748,67 @@ fn collect_strings(v: &Value, out: &mut Vec<String>) {
         Value::Dictionary(d) => d.values().for_each(|i| collect_strings(i, out)),
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------
+// Per-UDID session pool
+// ---------------------------------------------------------------
+//
+// iOS 26 doesn't seem to release kperf between consecutive
+// `setConfig` / `start` calls from new connections — the second
+// attempt's setConfig is silently swallowed and no kdebug data
+// streams. PerfDog presumably keeps a single long-lived
+// coreprofile session open and just demarcates measurements by
+// timestamps; we do the same.
+//
+// First measure_cold_start creates the session per device and
+// registers it here. Subsequent measurements re-acquire the same
+// session, re-fetch machTimeInfo for a fresh t0, fire the launch
+// RPC, and wait for the first 0x2B event past t0. The kdebug
+// stream keeps flowing continuously — we never call `stop`.
+//
+// Cleanup: sessions live until the process exits. A stale session
+// (transport died) will surface as a read error on the next
+// measurement; the entry is removed and recreated.
+
+type SharedSession = Arc<Mutex<CoreProfileSessionRaw>>;
+static SESSIONS: std::sync::OnceLock<Mutex<HashMap<String, SharedSession>>> =
+    std::sync::OnceLock::new();
+
+fn sessions() -> &'static Mutex<HashMap<String, SharedSession>> {
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Get-or-create the coreprofile session for `udid`. If a previously-
+/// cached session's transport has died, drop it and create a fresh
+/// one.
+pub async fn acquire_session(udid: &str) -> Result<SharedSession> {
+    {
+        let map = sessions().lock().await;
+        if let Some(s) = map.get(udid) {
+            return Ok(s.clone());
+        }
+    }
+    // Create outside the map lock so we don't block other devices
+    // while doing the ~150ms transport open.
+    let session = CoreProfileSessionRaw::start(udid)
+        .await
+        .context("CoreProfileSessionRaw::start")?;
+    let shared: SharedSession = Arc::new(Mutex::new(session));
+    let mut map = sessions().lock().await;
+    // Race: another caller may have inserted while we were creating.
+    // Theirs wins — our session drops, theirs stays.
+    let entry = map.entry(udid.to_string()).or_insert_with(|| shared.clone());
+    Ok(entry.clone())
+}
+
+/// Forget the cached session for `udid` — caller signals it's broken
+/// (e.g. read error, kperf-wedge notice). The next acquire creates a
+/// fresh one. The Arc keeps any in-flight users alive until they
+/// drop.
+pub async fn invalidate_session(udid: &str) {
+    let mut map = sessions().lock().await;
+    map.remove(udid);
 }
 
 /// Generate an upper-case UUID-4 string — used as the `uuid` field
