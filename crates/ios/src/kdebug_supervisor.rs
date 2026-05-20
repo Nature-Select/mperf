@@ -38,9 +38,27 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 /// Capacity of the broadcast channel. Sized to absorb ~3 launches
-/// worth of events without lagging the slowest subscriber. Each KdEvent
-/// is ~64 bytes so capacity 16384 ≈ 1MB resident.
-const EVENT_CHANNEL_CAPACITY: usize = 16 * 1024;
+/// worth of LAUNCH-RELEVANT events (after class filter, that's a
+/// few hundred per launch). 8K is overkill but cheap (~512KB).
+const EVENT_CHANNEL_CAPACITY: usize = 8 * 1024;
+
+/// Classes we forward to subscribers. Everything else is dropped at
+/// the supervisor to keep broadcast volume manageable.
+///
+/// Without this filter, real-device tests show ~200K events/sec
+/// going through coreprofile during a launch — a Tokio broadcast
+/// channel can't keep up and consumers see massive Lagged counts,
+/// dropping the events we actually wanted.
+///
+/// 0x1F = DBG_DYLD (Dyld init on older iOS)
+/// 0x2B = DBG_APPS (UIKit / AppKit / Dyld-modern lifecycle)
+/// 0x31 = DBG_PERF (Initial Frame Rendering on older iOS)
+/// 0x07 = misc image loading
+///
+/// Future jank/perf work can extend this list. Keep narrow.
+fn is_launch_relevant_class(class: u8) -> bool {
+    matches!(class, 0x07 | 0x1f | 0x2b | 0x31)
+}
 
 /// Held in the per-UDID pool. The supervisor owns the background
 /// drain task and the broadcast Sender. `subscribe()` hands out fresh
@@ -144,11 +162,22 @@ async fn run_drain_task(
                     );
                     healthy_events_seen = true;
                 }
-                // Broadcast every event. `send` errors if there are
-                // zero subscribers — that's normal (idle between
-                // measurements), so we ignore.
+                // Filter to launch-relevant classes BEFORE broadcasting.
+                // Without this, ~95% of events are kernel noise that
+                // saturates the channel and starves consumers of the
+                // 0x2B events they actually need.
+                let mut forwarded = 0usize;
                 for ev in events {
+                    if !is_launch_relevant_class(ev.class_code()) {
+                        continue;
+                    }
+                    // `send` errors only when there are zero
+                    // subscribers (idle between measurements) — drop.
                     let _ = tx.send(ev);
+                    forwarded += 1;
+                }
+                if forwarded > 0 {
+                    tracing::trace!(forwarded, "kdebug supervisor: forwarded batch");
                 }
             }
             RawPayload::StatusNotice { strings } => {
