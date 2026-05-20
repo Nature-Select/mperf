@@ -15,6 +15,7 @@ mod battery;
 mod connect;
 mod core_profile_session_raw;
 mod cpu;
+mod kdebug_supervisor;
 mod devices;
 mod graphics;
 mod graphics_raw;

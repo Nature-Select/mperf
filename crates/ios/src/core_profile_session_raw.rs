@@ -34,10 +34,8 @@ use idevice::{
     IdeviceService, ReadWrite,
 };
 use plist::{Dictionary, Value};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 
 const SERVICE_CORE_PROFILE: &str = "com.apple.instruments.server.services.coreprofilesessiontap";
 const SERVICE_DTSERVICEHUB: &str = "com.apple.instruments.dtservicehub";
@@ -84,6 +82,33 @@ impl KdEvent {
     pub fn subclass_code(&self) -> u8 {
         ((self.debug_id & KDBG_SUBCLASS_MASK) >> KDBG_SUBCLASS_OFFSET) as u8
     }
+}
+
+/// One DTX payload from the coreprofile channel, classified.
+/// `next_payload` returns this so the supervisor (and only the
+/// supervisor) decides what to do with each kind. We intentionally
+/// don't elevate "DTTapStatusMessage" to an Err — the supervisor may
+/// want to log+continue rather than abort the whole task.
+#[derive(Debug)]
+pub enum RawPayload {
+    /// A kdebug batch parsed from the inner NSData of a
+    /// DTKTraceTapMessage push (iOS 26 wraps all kdebug pushes this
+    /// way). The Vec may be empty if the inner NSData was too small
+    /// to contain any 64-byte records — preserved for completeness.
+    KdEvents(Vec<KdEvent>),
+    /// Initial stackshot kcdata blob (~1MB). Sent once at session
+    /// start; the supervisor discards it.
+    Stackshot { bytes_len: usize },
+    /// bplist push with no NSData inside — the recurring cc/tv/tc
+    /// ack at config-accept, or periodic empty pings.
+    EmptyAck { bytes_len: usize },
+    /// A DTTapStatusMessage notice (e.g. "_lockKPerf: could not
+    /// lock"). Strings extracted so the supervisor can log without
+    /// re-parsing the bplist.
+    StatusNotice { strings: Vec<String> },
+    /// Anything else that arrived on the wire — diagnostic only,
+    /// supervisor logs and discards.
+    Unknown { first8: Vec<u8>, bytes_len: usize },
 }
 
 /// Device timebase. Multiply mach ticks by `numer/denom` to get ns.
@@ -373,98 +398,6 @@ impl CoreProfileSessionRaw {
         Ok(())
     }
 
-    /// Capture kdebug events for up to `max_window` after the caller
-    /// dispatched a launch_app RPC. Returns the largest class-0x2B
-    /// event timestamp (in mach ticks) past `mti.mach_absolute_time`
-    /// — i.e. the last UIKit lifecycle event of the launch we just
-    /// fired.
-    ///
-    /// Designed to be called REPEATEDLY on the same session — each
-    /// call captures one launch by filtering events with timestamp >
-    /// `mti.mach_absolute_time`. The caller is responsible for
-    /// re-fetching mti right before each launch so old events from
-    /// previous measurements are excluded.
-    pub async fn capture_post_launch_timestamp(
-        &mut self,
-        mti: &MachTimeInfo,
-        max_window: Duration,
-    ) -> Result<u64> {
-        let launch_t0 = Instant::now();
-        let watch_deadline = launch_t0 + max_window;
-        let stream_alive_deadline = launch_t0 + Duration::from_millis(1500);
-        let mut events_seen: u64 = 0;
-        let mut last_2b_mach: Option<u64> = None;
-        let max_ticks = (5_000_000_000u128 * mti.denom as u128 / mti.numer as u128) as u64;
-        let mut iter = 0u32;
-        let mut timeouts = 0u32;
-        tracing::info!("capture: begin watching kdebug stream");
-        loop {
-            iter += 1;
-            let now = Instant::now();
-            if events_seen == 0 && now >= stream_alive_deadline && last_2b_mach.is_none() {
-                tracing::warn!(
-                    iter,
-                    timeouts,
-                    elapsed_ms = (now - launch_t0).as_millis() as u64,
-                    "capture: kperf wedge detected, bailing"
-                );
-                anyhow::bail!(
-                    "kperf appears wedged on the device (no kdebug data 1.5s after launch). \
-                     iOS kperf is a global resource that doesn't always release between mperf \
-                     processes; the workaround is to RESTART THE IPHONE — `pnpm dev` restart \
-                     alone won't help"
-                );
-            }
-            let remaining = watch_deadline.saturating_duration_since(now);
-            if remaining.is_zero() {
-                tracing::warn!(iter, timeouts, events_seen, "capture: hit max_window deadline");
-                break;
-            }
-            let events = match tokio::time::timeout(
-                Duration::from_millis(400).min(remaining),
-                self.next_events(),
-            )
-            .await
-            {
-                Ok(Ok(events)) => events,
-                Ok(Err(e)) => {
-                    tracing::warn!(iter, error = %e, "capture: next_events errored");
-                    return Err(e);
-                }
-                Err(_) if last_2b_mach.is_some() => {
-                    tracing::info!(events_seen, "capture: 400ms quiet after events, done");
-                    break;
-                }
-                Err(_) => {
-                    timeouts += 1;
-                    continue;
-                }
-            };
-            events_seen += events.len() as u64;
-            for ev in &events {
-                if ev.class_code() != 0x2b {
-                    continue;
-                }
-                if ev.timestamp_mach <= mti.mach_absolute_time {
-                    continue;
-                }
-                let delta = ev.timestamp_mach - mti.mach_absolute_time;
-                if delta > max_ticks {
-                    continue;
-                }
-                last_2b_mach = Some(
-                    last_2b_mach.map_or(ev.timestamp_mach, |prev| prev.max(ev.timestamp_mach)),
-                );
-            }
-        }
-        last_2b_mach.ok_or_else(|| {
-            anyhow!(
-                "no UIKit kdebug events (class 0x2B) seen after launch in window — \
-                 ({events_seen} events, {timeouts} timeouts, {iter} iters)"
-            )
-        })
-    }
-
     /// Send one outgoing DTX message. Doesn't wait for any reply.
     async fn send_message(
         &mut self,
@@ -487,115 +420,76 @@ impl CoreProfileSessionRaw {
         Ok(())
     }
 
-    /// Read the next batch of kdebug events. Skips:
-    ///   - replies on channel 0 (mount/etc — already past that phase)
-    ///   - bplist payloads (acks, notices)
-    ///   - stackshot kcdata blobs
-    /// Returns when we get a payload that looks like a kd_buf batch.
-    pub async fn next_events(&mut self) -> Result<Vec<KdEvent>> {
+    /// Read one DTX message off the wire and classify the payload.
+    /// The supervisor calls this in a tight loop and decides what to
+    /// do with each variant — discard, log, broadcast, or abort.
+    ///
+    /// Returns Err only on stream-level failure (TCP closed, malformed
+    /// DTX framing). Device-side status notices are surfaced as
+    /// `RawPayload::StatusNotice`, not Err — the supervisor decides
+    /// how serious that is.
+    pub async fn next_payload(&mut self) -> Result<RawPayload> {
         loop {
             let msg = self.read_lenient().await?;
             let Some(bytes) = msg.raw_data else {
-                tracing::debug!(
+                tracing::trace!(
                     chan = msg.channel,
                     id = msg.identifier,
                     conv = msg.conversation_index,
-                    "next_events: empty payload, skipping"
+                    "next_payload: empty payload, looping"
                 );
                 continue;
             };
             if bytes.is_empty() {
                 continue;
             }
+            // Stackshot kcdata (KCDATA_BUFFER_BEGIN_STACKSHOT) — sent
+            // once per tap creation, supervisor discards.
             if bytes.starts_with(&[0x07, b'X', 0xa2, b'Y']) {
-                tracing::info!(bytes_len = bytes.len(), "next_events: stackshot kcdata (skip)");
-                continue;
+                return Ok(RawPayload::Stackshot {
+                    bytes_len: bytes.len(),
+                });
             }
-            // iOS 26 wraps EVERY coreprofile push in a
-            // DTKTraceTapMessage NSKeyedArchive container — the raw
-            // kdebug bytes live as an NSData field inside. (Older
-            // iOS apparently sent raw bytes per pymobiledevice3's
-            // docstring, but our device does not.) Unwrap and look
-            // for an NSData payload to parse as kd_buf records.
+            // iOS 26 wraps every kdebug push in a DTKTraceTapMessage
+            // NSKeyedArchive container — kdebug bytes live inside as
+            // an NSData. If no NSData inside, it's either a status
+            // notice (DTTapStatusMessage) or an empty ack.
             if bytes.starts_with(b"bplist") {
-                match extract_inner_data(&bytes) {
-                    Some(inner) if inner.len() >= 8 => {
-                        // bm=1 streams add a variable-length preamble
-                        // before the 64-byte kd_buf records (~46 bytes
-                        // observed). Try parsing from the trailing
-                        // (inner_len % 64)-bytes-aligned offset; if
-                        // that gives plausible records (any of class
-                        // 0x1F / 0x2B / 0x31 present, or just a
-                        // non-empty parse), return them.
-                        let preamble = inner.len() % 64;
-                        let events = parse_kd_buf_records(&inner[preamble..]);
-                        if !events.is_empty() {
-                            tracing::info!(
-                                outer = bytes.len(),
-                                inner = inner.len(),
-                                preamble,
-                                n_events = events.len(),
-                                first8 = ?&inner[..inner.len().min(8)],
-                                "next_events: unwrapped DTKTraceTapMessage → kdebug batch"
-                            );
-                            return Ok(events);
-                        }
+                if let Some(inner) = extract_inner_data(&bytes) {
+                    if inner.len() < 8 {
+                        // NSData present but too small to be records.
+                        return Ok(RawPayload::EmptyAck {
+                            bytes_len: bytes.len(),
+                        });
                     }
-                    Some(inner) => {
-                        tracing::info!(
-                            outer = bytes.len(),
-                            inner_len = inner.len(),
-                            first8 = ?&inner[..inner.len().min(8)],
-                            "next_events: unwrapped NSData but too small (skip)"
-                        );
-                    }
-                    None => {
-                        let strs = scan_bplist_strings(&bytes);
-                        // Surface any DTTapStatusMessage notice as a
-                        // dedicated error instead of letting the watch
-                        // loop wait 5s for events that will never come.
-                        // The wording varies (kperf-lock, "Failed to
-                        // start", "could not", etc.) so we key off
-                        // either the class name or the presence of a
-                        // `notice`/`error`/`status` field plus any
-                        // string that looks like a sentence (contains
-                        // a space, not all NSKeyedArchive scaffolding).
-                        let is_status = strs
-                            .iter()
-                            .any(|s| s == "DTTapStatusMessage");
-                        if is_status {
-                            let detail = strs
-                                .iter()
-                                .find(|s| s.contains(' ') && s.len() > 20)
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    format!("status message: {strs:?}")
-                                });
-                            return Err(anyhow!(
-                                "coreprofile rejected setConfig/start: {detail} \
-                                 (device-side kperf release is asynchronous — wait several \
-                                 seconds and retry)"
-                            ));
-                        }
-                        tracing::info!(
-                            bytes_len = bytes.len(),
-                            strings = ?strs,
-                            "next_events: bplist with no NSData (status ping, skip)"
-                        );
-                    }
+                    // bm=1 streams add a variable-length preamble
+                    // before the 64-byte kd_buf records (~46 bytes
+                    // observed). Skip (inner_len % 64) bytes.
+                    let preamble = inner.len() % 64;
+                    let events = parse_kd_buf_records(&inner[preamble..]);
+                    return Ok(RawPayload::KdEvents(events));
                 }
-                continue;
+                let strings = scan_bplist_strings(&bytes);
+                let is_status = strings.iter().any(|s| s == "DTTapStatusMessage");
+                if is_status {
+                    return Ok(RawPayload::StatusNotice { strings });
+                }
+                return Ok(RawPayload::EmptyAck {
+                    bytes_len: bytes.len(),
+                });
             }
+            // Not bplist, not stackshot — try raw records as a last
+            // resort (older iOS pushes were like this per
+            // pymobiledevice3's docstring).
             let events = parse_kd_buf_records(&bytes);
-            if events.is_empty() {
-                tracing::info!(
-                    bytes_len = bytes.len(),
-                    first8 = ?&bytes[..bytes.len().min(8)],
-                    "next_events: unknown non-kdebug payload (skip)"
-                );
-                continue;
+            if !events.is_empty() {
+                return Ok(RawPayload::KdEvents(events));
             }
-            return Ok(events);
+            let first8: Vec<u8> = bytes.iter().take(8).copied().collect();
+            return Ok(RawPayload::Unknown {
+                first8,
+                bytes_len: bytes.len(),
+            });
         }
     }
 
@@ -770,38 +664,6 @@ fn collect_strings(v: &Value, out: &mut Vec<String>) {
         Value::Dictionary(d) => d.values().for_each(|i| collect_strings(i, out)),
         _ => {}
     }
-}
-
-// ---------------------------------------------------------------
-// Per-call session
-// ---------------------------------------------------------------
-//
-// We previously cached the coreprofile session per UDID (idea:
-// PerfDog presumably keeps it open across measurements). That
-// caused a different bug: between calls iOS would silently close
-// the TCP stream, and the next measurement hit
-// "dtx payload header truncated: 0 bytes" on the first read. The
-// cure (invalidate + recreate) added ~7s to the second measurement.
-//
-// New design: create a fresh session per call. The retry wrapper
-// in startup.rs handles kperf-release races. The `Arc<Mutex>` shape
-// is preserved for API stability with the caller, even though we
-// no longer reuse instances.
-
-type SharedSession = Arc<Mutex<CoreProfileSessionRaw>>;
-
-/// Open a fresh coreprofile session for `udid`. No caching — every
-/// measurement gets its own transport.
-pub async fn acquire_session(udid: &str) -> Result<SharedSession> {
-    let session = CoreProfileSessionRaw::start(udid)
-        .await
-        .context("CoreProfileSessionRaw::start")?;
-    Ok(Arc::new(Mutex::new(session)))
-}
-
-/// No-op kept for API compatibility — there's no cache to invalidate
-/// anymore. Callers can keep calling it on error paths; we ignore.
-pub async fn invalidate_session(_udid: &str) {
 }
 
 /// Generate an upper-case UUID-4 string — used as the `uuid` field
