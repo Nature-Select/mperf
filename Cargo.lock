@@ -2150,7 +2150,7 @@ dependencies = [
 
 [[package]]
 name = "mperf-android"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2167,7 +2167,7 @@ dependencies = [
 
 [[package]]
 name = "mperf-core"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "futures",
@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "mperf-desktop"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "mperf-android",
@@ -2206,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "mperf-ios"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2223,7 +2223,7 @@ dependencies = [
 
 [[package]]
 name = "mperf-schema"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "mperf-storage"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "mperf-schema",
