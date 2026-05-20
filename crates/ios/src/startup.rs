@@ -41,35 +41,34 @@ pub struct StartupTiming {
 }
 
 pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTiming> {
+    tracing::info!(bundle_id, "measure_cold_start begin");
     if let Err(e) = launch_app_with_options(udid, "com.apple.springboard", false).await {
-        tracing::debug!(error = %e, "cold start: SpringBoard pre-launch failed; continuing");
+        tracing::info!(error = %e, "cold start: SpringBoard pre-launch failed; continuing");
     } else {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    tracing::info!("cold start: SpringBoard prep done, opening coreprofile transport");
 
-    // Coreprofile streamer on its own dedicated transport. After
-    // .start() returns, the device is pushing kdebug events.
     let mut cp = CoreProfileSessionRaw::start(udid)
         .await
         .context("CoreProfileSessionRaw::start")?;
+    tracing::info!("cold start: coreprofile streamer ready, opening processcontrol transport");
 
-    // Separate transport for machTimeInfo + processcontrol. Doing
-    // these on the coreprofile transport would interleave the
-    // request/reply with kdebug pushes and we'd lose events to the
-    // discard path while waiting for replies.
     let mut remote_pc = build_dtx_remote(udid)
         .await
         .context("DTX session for processcontrol")?;
+    tracing::info!("cold start: pc transport open, fetching machTimeInfo");
     let mti = fetch_mach_time_info(&mut remote_pc)
         .await
         .context("machTimeInfo")?;
-    tracing::debug!(?mti, "anchored mach time");
+    tracing::info!(?mti, "cold start: anchored mach time, building ProcessControlClient");
 
     let mut pc = ProcessControlClient::new(&mut remote_pc)
         .await
         .context("ProcessControlClient::new")?;
+    tracing::info!("cold start: dispatching launch_app RPC");
 
-    let _pid = pc
+    let pid = pc
         .launch_app(
             bundle_id.to_string(),
             None,
@@ -79,6 +78,7 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
         )
         .await
         .with_context(|| format!("processcontrol.launchApp({bundle_id})"))?;
+    tracing::info!(pid, "cold start: launch_app returned, watching kdebug stream for 0x31C00506");
 
     // Look for 0x31C00506 with timestamp > mti.mach_absolute_time
     // (to filter out stale events queued before mti was captured).
@@ -98,18 +98,40 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
         let events = tokio::time::timeout(remaining, cp.next_events())
             .await
             .map_err(|_| anyhow!("kdebug stream timed out waiting for first-frame event"))??;
-        events_seen += events.len() as u64;
+        let batch_n = events.len();
+        events_seen += batch_n as u64;
+        // Diagnostic: dump unique debug_ids in this batch so we can
+        // see what's actually arriving when the first-frame marker
+        // never matches.
+        if events_seen <= 5_000 {
+            let mut classes: std::collections::BTreeSet<u8> =
+                std::collections::BTreeSet::new();
+            let mut has_target = false;
+            for e in &events {
+                classes.insert(e.class_code());
+                if e.debug_id == FIRST_FRAME_END_DEBUG_ID {
+                    has_target = true;
+                }
+            }
+            tracing::info!(
+                batch_n,
+                events_seen,
+                ?classes,
+                has_target,
+                "kdebug batch"
+            );
+        }
         if let Some(ev) = events.iter().find(|e| {
             e.debug_id == FIRST_FRAME_END_DEBUG_ID
                 && e.timestamp_mach > mti.mach_absolute_time
         }) {
             let delta = ev.timestamp_mach - mti.mach_absolute_time;
             let total_ns = mti.ticks_delta_to_ns(delta);
-            tracing::debug!(
+            tracing::info!(
                 events_seen,
                 delta_ticks = delta,
                 total_ns,
-                "cold start measured"
+                "cold start: first-frame event captured"
             );
             break total_ns / 1_000_000;
         }

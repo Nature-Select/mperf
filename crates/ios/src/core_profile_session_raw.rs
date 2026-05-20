@@ -149,10 +149,12 @@ impl CoreProfileSessionRaw {
         // Bounded: device should publish capabilities < 2s; mount
         // reply should arrive < 2s. Hangs here are protocol-level
         // bugs we want to surface, not silently wait on.
+        tracing::info!("coreprofile: transport opened, waiting for capabilities");
         tokio::time::timeout(Duration::from_secs(5), s.consume_initial_capabilities())
             .await
             .map_err(|_| anyhow!("timed out waiting for _notifyOfPublishedCapabilities"))?
             .context("consume initial capabilities")?;
+        tracing::info!("coreprofile: capabilities consumed, mounting channel");
 
         let ch = tokio::time::timeout(
             Duration::from_secs(5),
@@ -162,14 +164,12 @@ impl CoreProfileSessionRaw {
         .map_err(|_| anyhow!("timed out mounting coreprofile channel"))?
         .context("mount coreprofile")?;
         s.coreprofile_channel = ch;
-        tracing::debug!(ch, "coreprofile channel mounted");
+        tracing::info!(ch, "coreprofile channel mounted");
 
-        // setConfig: + start — fire-and-forget. We don't read the
-        // bplist ack here; if it arrives, our next_events loop will
-        // skip it (starts_with("bplist") filter).
         s.send_set_config().await.context("send setConfig")?;
+        tracing::info!("coreprofile: setConfig sent");
         s.send_start().await.context("send start")?;
-        tracing::debug!("coreprofile streaming started");
+        tracing::info!("coreprofile streaming started");
 
         Ok(s)
     }
@@ -311,23 +311,33 @@ impl CoreProfileSessionRaw {
     pub async fn next_events(&mut self) -> Result<Vec<KdEvent>> {
         loop {
             let msg = self.read_lenient().await?;
-            let Some(bytes) = msg.raw_data else { continue };
+            let Some(bytes) = msg.raw_data else {
+                tracing::debug!(
+                    chan = msg.channel,
+                    id = msg.identifier,
+                    conv = msg.conversation_index,
+                    "next_events: empty payload, skipping"
+                );
+                continue;
+            };
             if bytes.is_empty() {
                 continue;
             }
-            // Stackshot kcdata (KCDATA_BUFFER_BEGIN_STACKSHOT little-
-            // endian = 0x59A25807) — sent once per tap, ignore.
             if bytes.starts_with(&[0x07, b'X', 0xa2, b'Y']) {
-                tracing::trace!(bytes_len = bytes.len(), "skipping stackshot kcdata");
+                tracing::info!(bytes_len = bytes.len(), "next_events: stackshot kcdata (skip)");
                 continue;
             }
-            // bplist acks/notices — kdebug data isn't bplist.
             if bytes.starts_with(b"bplist") {
-                tracing::trace!(bytes_len = bytes.len(), "skipping bplist payload");
+                tracing::info!(bytes_len = bytes.len(), "next_events: bplist payload (skip)");
                 continue;
             }
             let events = parse_kd_buf_records(&bytes);
             if events.is_empty() {
+                tracing::info!(
+                    bytes_len = bytes.len(),
+                    first8 = ?&bytes[..bytes.len().min(8)],
+                    "next_events: unknown non-kdebug payload (skip)"
+                );
                 continue;
             }
             return Ok(events);
