@@ -40,10 +40,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const SERVICE_CORE_PROFILE: &str = "com.apple.instruments.server.services.coreprofilesessiontap";
 const SERVICE_DTSERVICEHUB: &str = "com.apple.instruments.dtservicehub";
 
-/// Apple kdebug debug_id for "Initial Frame Rendering END" — class
-/// 0x31, subclass 0xCA, code 1, func DBG_FUNC_END(2). This is the
-/// event PerfDog's iOS "App Launch" timer ends on; it fires once per
-/// app launch right after the first frame is committed to the display.
+/// Apple kdebug debug_id for "Initial Frame Rendering END" on iOS 16
+/// and earlier (class 0x31, subclass 0xC0, code 321, FUNC_END=2).
+/// iOS 26 no longer emits this — first-frame timing now arrives as
+/// class 0x2B / subclass 0x87 (UIKit) events with codes we don't
+/// have a phase table for. Kept for documentation + future phase-
+/// breakdown work; current measurement uses "last 0x2B event" as a
+/// proxy.
+#[allow(dead_code)]
 pub const FIRST_FRAME_END_DEBUG_ID: u32 = 0x31C00506;
 
 /// Apple kdebug debug_id masks (from `bsd/sys/kdebug.h`). Kept here

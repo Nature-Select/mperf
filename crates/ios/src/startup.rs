@@ -18,9 +18,7 @@
 //! device on a black screen.
 
 use crate::connect;
-use crate::core_profile_session_raw::{
-    CoreProfileSessionRaw, MachTimeInfo, FIRST_FRAME_END_DEBUG_ID,
-};
+use crate::core_profile_session_raw::{CoreProfileSessionRaw, MachTimeInfo};
 use crate::launch::launch_app_with_options;
 use anyhow::{anyhow, Context, Result};
 use idevice::{
@@ -80,78 +78,76 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
         .with_context(|| format!("processcontrol.launchApp({bundle_id})"))?;
     tracing::info!(pid, "cold start: launch_app returned, watching kdebug stream for 0x31C00506");
 
-    // Look for 0x31C00506 with timestamp > mti.mach_absolute_time
-    // (to filter out stale events queued before mti was captured).
-    // Bound at 15s so a missed first-frame event doesn't hang us.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // iOS 26 changed the UIKit kdebug codes — py-ios-device's
+    // 0x31C00506 (class 0x31, subclass 0xC0, code 1, FUNC_END) never
+    // arrives. Real launch events come through as class 0x2B /
+    // subclass 0x87 (UIKit) with new code numbers we don't yet have
+    // a phase table for.
+    //
+    // Pragmatic heuristic: collect events for up to 5s OR until the
+    // stream goes quiet for 400ms (whichever first), then take the
+    // LATEST class-0x2B event whose timestamp is past mti — that's
+    // the last UIKit lifecycle event of the launch, which lands
+    // roughly at "first frame committed". Bounded by a sanity check
+    // (timestamp within ~5s of mti, to ignore misaligned-byte
+    // garbage in pre-launch V3-header chunks).
+    let watch_deadline = Instant::now() + Duration::from_secs(5);
     let mut events_seen: u64 = 0;
-    let total_ms = loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+    let mut last_2b_mach: Option<u64> = None;
+    // 5s of ticks at our (numer/denom). Anything beyond this is
+    // misalignment.
+    let max_ticks = (5_000_000_000u128 * mti.denom as u128 / mti.numer as u128) as u64;
+    loop {
+        let remaining = watch_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            let _ = cp.stop().await;
-            anyhow::bail!(
-                "no Initial Frame Rendering END (0x31C00506) event within 15s after launch \
-                 ({events_seen} kdebug events seen); device might be throttled, the app may \
-                 not have a UI, or the kdf2 filter wasn't applied"
-            );
+            break;
         }
-        let events = tokio::time::timeout(remaining, cp.next_events())
-            .await
-            .map_err(|_| anyhow!("kdebug stream timed out waiting for first-frame event"))??;
-        let batch_n = events.len();
-        events_seen += batch_n as u64;
-        if events_seen <= 50_000 {
-            let mut classes: std::collections::BTreeSet<u8> =
-                std::collections::BTreeSet::new();
-            // Collect debug_ids of class 0x31 (UI / first-frame) and
-            // class 0x2B (app lifecycle) events. iOS 26 may use a
-            // different debug_id than py-ios-device's 0x31C00506 for
-            // first-frame — we want to find it empirically.
-            let mut class31_ids: Vec<String> = Vec::new();
-            let mut class2b_ids: Vec<String> = Vec::new();
-            let mut class1f_ids: Vec<String> = Vec::new();
-            let mut has_target = false;
-            for e in &events {
-                classes.insert(e.class_code());
-                match e.class_code() {
-                    0x31 => class31_ids.push(format!("{:#010x}", e.debug_id)),
-                    0x2b => class2b_ids.push(format!("{:#010x}", e.debug_id)),
-                    0x1f => class1f_ids.push(format!("{:#010x}", e.debug_id)),
-                    _ => {}
-                }
-                if e.debug_id == FIRST_FRAME_END_DEBUG_ID {
-                    has_target = true;
-                }
+        let events = match tokio::time::timeout(
+            Duration::from_millis(400).min(remaining),
+            cp.next_events(),
+        )
+        .await
+        {
+            Ok(Ok(events)) => events,
+            Ok(Err(e)) => return Err(e),
+            // 400ms of silence after seeing some events → stream is
+            // quiet, launch is done.
+            Err(_) if last_2b_mach.is_some() => break,
+            Err(_) => continue, // no events yet, keep waiting
+        };
+        events_seen += events.len() as u64;
+        for ev in &events {
+            if ev.class_code() != 0x2b {
+                continue;
             }
-            tracing::info!(
-                batch_n,
-                events_seen,
-                ?classes,
-                has_target,
-                class31_count = class31_ids.len(),
-                class2b_count = class2b_ids.len(),
-                class1f_count = class1f_ids.len(),
-                class31_ids = ?class31_ids,
-                class2b_ids = ?class2b_ids,
-                class1f_ids = ?class1f_ids,
-                "kdebug batch"
-            );
-        }
-        if let Some(ev) = events.iter().find(|e| {
-            e.debug_id == FIRST_FRAME_END_DEBUG_ID
-                && e.timestamp_mach > mti.mach_absolute_time
-        }) {
+            if ev.timestamp_mach <= mti.mach_absolute_time {
+                continue;
+            }
             let delta = ev.timestamp_mach - mti.mach_absolute_time;
-            let total_ns = mti.ticks_delta_to_ns(delta);
-            tracing::info!(
-                events_seen,
-                delta_ticks = delta,
-                total_ns,
-                "cold start: first-frame event captured"
-            );
-            break total_ns / 1_000_000;
+            if delta > max_ticks {
+                continue;
+            }
+            last_2b_mach =
+                Some(last_2b_mach.map_or(ev.timestamp_mach, |prev| prev.max(ev.timestamp_mach)));
         }
-    };
+    }
+    let last_ts = last_2b_mach.ok_or_else(|| {
+        let _ = ();
+        anyhow!(
+            "no UIKit kdebug events (class 0x2B) seen after launch in 5s ({events_seen} total \
+             events received) — kdf2 filter likely wasn't applied; PerfDog parity blocked"
+        )
+    })?;
+    let delta = last_ts - mti.mach_absolute_time;
+    let total_ns = mti.ticks_delta_to_ns(delta);
+    let total_ms = total_ns / 1_000_000;
+    tracing::info!(
+        events_seen,
+        delta_ticks = delta,
+        total_ns,
+        total_ms,
+        "cold start: last UIKit event captured (proxy for first-frame)"
+    );
 
     let _ = cp.stop().await;
     Ok(StartupTiming { total_ms })
