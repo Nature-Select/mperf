@@ -26,6 +26,7 @@ import {
 } from '@/lib/ipc'
 import { formatDateTime, formatDuration } from '@/lib/format'
 import { MarkerControls } from '@/lib/markers'
+import { useMetricsSelection } from '@/lib/useMetricsSelection'
 import { StaticCpuChart } from './StaticCpuChart'
 import { StaticPerCoreChart } from './StaticPerCoreChart'
 import { StaticFpsChart } from './StaticFpsChart'
@@ -251,6 +252,13 @@ function EmptyDetail() {
 
 function SessionDetail({ session }: { session: SessionInfo }) {
   const qc = useQueryClient()
+  // Mirrors LiveView's chart gating — we still capture every metric on
+  // the backend (no schema or sampler changes), so flipping a metric
+  // back on in the picker re-surfaces its chart here without needing
+  // to re-record. Trades a small UX cost (you have to remember what
+  // you toggled off) for retroactive data access, which is the right
+  // default for performance debugging.
+  const { selected: metricsSelection } = useMetricsSelection()
   const { data: total, isLoading: lt } = useQuery<SamplePoint[]>({
     queryKey: ['samples', session.id, 'cpu_total_pct'],
     queryFn: () => getSessionSamples(session.id, 'cpu_total_pct'),
@@ -386,20 +394,16 @@ function SessionDetail({ session }: { session: SessionInfo }) {
         <span>·</span>
         <span>{total?.length ?? 0} samples</span>
       </div>
-      <StaticCpuChart
-        points={total ?? []}
-        appPoints={appCpu ?? []}
-        markers={markerControls}
-        wallStartMs={session.wall_start_ms}
-      />
-      {(cores ?? []).length > 0 && (
-        <StaticPerCoreChart
-          rows={cores ?? []}
-          markers={markerControls}
-          wallStartMs={session.wall_start_ms}
-        />
-      )}
-      {(fps ?? []).length > 0 && (
+      {/*
+        Chart order matches LiveView's picker-driven order
+        (Frame → CPU Usage → CPU Core → Memory → GPU → Temperature) so
+        scrolling Live and History feels like the same list. Each card
+        is gated by BOTH (a) the user's current picker selection and
+        (b) whether the session actually has data for this metric —
+        toggling a metric back on in the picker resurfaces its chart
+        without needing to re-record.
+      */}
+      {metricsSelection.has('frame') && (fps ?? []).length > 0 && (
         <StaticFpsChart
           fpsPoints={fps ?? []}
           smallJankTotal={Math.round(smallJankTotal)}
@@ -411,30 +415,49 @@ function SessionDetail({ session }: { session: SessionInfo }) {
           wallStartMs={session.wall_start_ms}
         />
       )}
-      {((gpuDevice ?? []).length > 0 || (gpuRenderer ?? []).length > 0 || (gpuTiler ?? []).length > 0) && (
-        <StaticGpuChart
-          devicePoints={gpuDevice ?? []}
-          rendererPoints={gpuRenderer ?? []}
-          tilerPoints={gpuTiler ?? []}
+      {metricsSelection.has('cpu_usage') && (
+        <StaticCpuChart
+          points={total ?? []}
+          appPoints={appCpu ?? []}
           markers={markerControls}
           wallStartMs={session.wall_start_ms}
         />
       )}
-      {((temps ?? []).length > 0 || (batteryTemps ?? []).length > 0) && (
-        <StaticTemperatureChart
-          cpuPoints={temps ?? []}
-          batteryPoints={batteryTemps ?? []}
+      {metricsSelection.has('cpu_core') && (cores ?? []).length > 0 && (
+        <StaticPerCoreChart
+          rows={cores ?? []}
           markers={markerControls}
           wallStartMs={session.wall_start_ms}
         />
       )}
-      {(pss ?? []).length > 0 && (
+      {metricsSelection.has('memory') && (pss ?? []).length > 0 && (
         <StaticMemoryChart
           pssPoints={pss ?? []}
           markers={markerControls}
           wallStartMs={session.wall_start_ms}
         />
       )}
+      {metricsSelection.has('gpu') &&
+        ((gpuDevice ?? []).length > 0 ||
+          (gpuRenderer ?? []).length > 0 ||
+          (gpuTiler ?? []).length > 0) && (
+          <StaticGpuChart
+            devicePoints={gpuDevice ?? []}
+            rendererPoints={gpuRenderer ?? []}
+            tilerPoints={gpuTiler ?? []}
+            markers={markerControls}
+            wallStartMs={session.wall_start_ms}
+          />
+        )}
+      {metricsSelection.has('temperature') &&
+        ((temps ?? []).length > 0 || (batteryTemps ?? []).length > 0) && (
+          <StaticTemperatureChart
+            cpuPoints={temps ?? []}
+            batteryPoints={batteryTemps ?? []}
+            markers={markerControls}
+            wallStartMs={session.wall_start_ms}
+          />
+        )}
     </div>
   )
 }
