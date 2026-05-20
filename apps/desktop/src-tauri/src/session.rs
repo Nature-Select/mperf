@@ -47,6 +47,10 @@ pub struct Session {
     /// Wall-clock ms when the session was created. Markers compute their
     /// `ts_us` (offset from session start) as `(now_ms - wall_start_ms) * 1000`.
     pub wall_start_ms: i64,
+    /// Bundle id of the app the session is recording. `measure_startup`
+    /// checks this before persisting a startup timing — we only attach
+    /// the measurement to the session if it's for the same app.
+    pub app_bundle_id: Option<String>,
     scheduler: SchedulerHandle,
     writer_task: Option<JoinHandle<()>>,
     /// Set true right before we tear down the scheduler from a
@@ -178,6 +182,7 @@ pub async fn start_recording(
         *guard = Some(Session {
             db_id,
             wall_start_ms: session_wall_start_ms,
+            app_bundle_id: Some(target_pkg.clone()),
             scheduler: handle,
             writer_task: Some(writer_task),
             user_stopping,

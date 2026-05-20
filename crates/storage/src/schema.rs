@@ -15,7 +15,7 @@ use rusqlite::{params, Connection};
 /// Highest schema version known to this build. Surfaced via the
 /// Settings tab so users can sanity-check the on-disk DB after a
 /// migration.
-pub const HEAD: i32 = 6;
+pub const HEAD: i32 = 7;
 
 pub fn run_migrations(c: &mut Connection) -> rusqlite::Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)")?;
@@ -148,5 +148,15 @@ const MIGRATIONS: &[(i32, &str)] = &[
         // build had no concept of per-metric frequency; samplers ran
         // at hardcoded defaults".
         "ALTER TABLE sessions ADD COLUMN sampling_intervals TEXT;",
+    ),
+    (
+        7,
+        // JSON object with optional `cold_ms` and `hot_ms` numeric
+        // fields recording the user's startup-timing measurements
+        // taken during this session. Populated by the
+        // `measure_startup` command's "persist to active session"
+        // side-effect. NULL on pre-7 rows and on sessions where the
+        // user never ran a startup measurement.
+        "ALTER TABLE sessions ADD COLUMN startup_timings TEXT;",
     ),
 ];

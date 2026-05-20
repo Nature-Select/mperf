@@ -37,6 +37,17 @@ pub struct SessionInfo {
     pub app_bundle_id: Option<String>,
     pub selected_metrics: Option<Vec<String>>,
     pub sampling_intervals: Option<HashMap<String, u64>>,
+    pub startup_timings: Option<StartupTimings>,
+}
+
+/// Captured app-launch timings for this session. Either field may be
+/// absent if the user only ran one of the two measurements (or none).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StartupTimings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cold_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
