@@ -9,7 +9,7 @@ import {
   Typography,
 } from '@arco-design/web-react'
 import { Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   CoreSampleRow,
   deleteMarker,
@@ -260,8 +260,10 @@ function SessionDetail({ session }: { session: SessionInfo }) {
   // `showAll` is the escape hatch: backend captures every metric
   // regardless of selection, so if a user later wishes they hadn't
   // unticked Memory at recording time, flipping this surfaces the data
-  // that was always in the DB. Per-detail-view state — not persisted.
-  const [showAll, setShowAll] = useState(false)
+  // that was always in the DB. Persisted per-session in localStorage
+  // so revisiting a session you previously expanded stays expanded —
+  // matches the "session is a self-contained record" mental model.
+  const [showAll, setShowAll] = useShowAllForSession(session.id)
   const snapshot = session.selected_metrics
   const shows = (id: string) => showAll || snapshot === null || snapshot.includes(id)
   const { data: total, isLoading: lt } = useQuery<SamplePoint[]>({
@@ -486,6 +488,43 @@ function hiddenCount(snapshot: string[]): number {
   let n = 0
   for (const id of CHART_BACKED_METRICS) if (!snapshot.includes(id)) n += 1
   return n
+}
+
+/// Persist the "show all" choice per session id. Without this the
+/// expand decision resets every time the user clicks another session
+/// in the list and clicks back — feels broken because the session
+/// itself is unchanged. localStorage keeps it stable across reloads.
+/// Stale keys (session got deleted) waste a few bytes; not worth
+/// reaping eagerly.
+function useShowAllForSession(sessionId: number): [boolean, (v: boolean) => void] {
+  const key = `mperf.history.showAll.${sessionId}`
+  const [state, setState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(key) === '1'
+    } catch {
+      return false
+    }
+  })
+  // Refresh from storage when the session id changes — same SessionDetail
+  // instance can be reused for a different session by React.
+  useEffect(() => {
+    try {
+      setState(localStorage.getItem(key) === '1')
+    } catch {
+      setState(false)
+    }
+  }, [key])
+  const set = (v: boolean) => {
+    setState(v)
+    try {
+      if (v) localStorage.setItem(key, '1')
+      else localStorage.removeItem(key)
+    } catch {
+      // Quota / privacy mode — UI still updates, just won't survive
+      // reload. Not worth a visible error.
+    }
+  }
+  return [state, set]
 }
 
 /// Two-state info banner that lives between the session metadata row
