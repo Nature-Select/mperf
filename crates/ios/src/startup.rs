@@ -100,6 +100,7 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
     let last_ts = match result {
         Ok(ts) => ts,
         Err(e) => {
+            tracing::warn!(error = %e, "measure_cold_start: capture failed; invalidating session so the next attempt rebuilds the transport");
             drop(cp);
             invalidate_session(udid).await;
             return Err(e);

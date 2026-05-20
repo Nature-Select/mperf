@@ -390,21 +390,35 @@ impl CoreProfileSessionRaw {
         mti: &MachTimeInfo,
         max_window: Duration,
     ) -> Result<u64> {
-        let watch_deadline = Instant::now() + max_window;
-        let stream_alive_deadline = Instant::now() + Duration::from_millis(1500);
+        let launch_t0 = Instant::now();
+        let watch_deadline = launch_t0 + max_window;
+        let stream_alive_deadline = launch_t0 + Duration::from_millis(1500);
         let mut events_seen: u64 = 0;
         let mut last_2b_mach: Option<u64> = None;
         let max_ticks = (5_000_000_000u128 * mti.denom as u128 / mti.numer as u128) as u64;
+        let mut iter = 0u32;
+        let mut timeouts = 0u32;
+        tracing::info!("capture: begin watching kdebug stream");
         loop {
+            iter += 1;
             let now = Instant::now();
             if events_seen == 0 && now >= stream_alive_deadline && last_2b_mach.is_none() {
+                tracing::warn!(
+                    iter,
+                    timeouts,
+                    elapsed_ms = (now - launch_t0).as_millis() as u64,
+                    "capture: kperf wedge detected, bailing"
+                );
                 anyhow::bail!(
                     "kperf appears wedged on the device (no kdebug data 1.5s after launch). \
-                     The device-side session likely needs to be reset; close mperf and reopen"
+                     iOS kperf is a global resource that doesn't always release between mperf \
+                     processes; the workaround is to RESTART THE IPHONE — `pnpm dev` restart \
+                     alone won't help"
                 );
             }
             let remaining = watch_deadline.saturating_duration_since(now);
             if remaining.is_zero() {
+                tracing::warn!(iter, timeouts, events_seen, "capture: hit max_window deadline");
                 break;
             }
             let events = match tokio::time::timeout(
@@ -414,9 +428,18 @@ impl CoreProfileSessionRaw {
             .await
             {
                 Ok(Ok(events)) => events,
-                Ok(Err(e)) => return Err(e),
-                Err(_) if last_2b_mach.is_some() => break,
-                Err(_) => continue,
+                Ok(Err(e)) => {
+                    tracing::warn!(iter, error = %e, "capture: next_events errored");
+                    return Err(e);
+                }
+                Err(_) if last_2b_mach.is_some() => {
+                    tracing::info!(events_seen, "capture: 400ms quiet after events, done");
+                    break;
+                }
+                Err(_) => {
+                    timeouts += 1;
+                    continue;
+                }
             };
             events_seen += events.len() as u64;
             for ev in &events {
@@ -438,7 +461,7 @@ impl CoreProfileSessionRaw {
         last_2b_mach.ok_or_else(|| {
             anyhow!(
                 "no UIKit kdebug events (class 0x2B) seen after launch in window — \
-                 ({events_seen} total events received)"
+                 ({events_seen} events, {timeouts} timeouts, {iter} iters)"
             )
         })
     }
