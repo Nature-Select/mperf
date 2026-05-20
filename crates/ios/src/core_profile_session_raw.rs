@@ -328,25 +328,16 @@ impl CoreProfileSessionRaw {
                 continue;
             }
             if bytes.starts_with(b"bplist") {
-                // Decode so we can see what the device is telling
-                // us — coreprofile sends notices/errors as bplist
-                // dicts with 'notice', 'status', 'error' keys.
-                match ns_keyed_archive::decode::from_bytes(&bytes) {
-                    Ok(v) => {
-                        tracing::info!(
-                            bytes_len = bytes.len(),
-                            decoded = ?v,
-                            "next_events: bplist payload (skip)"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::info!(
-                            bytes_len = bytes.len(),
-                            decode_err = %e,
-                            "next_events: bplist payload (skip, decode failed)"
-                        );
-                    }
-                }
+                // ns_keyed_archive doesn't understand the DTTapMessage
+                // class — it leaves us looking at raw $top / $objects
+                // / Uid pointers. Walk it ourselves so we can see
+                // the human strings the device is actually sending.
+                let strs = scan_bplist_strings(&bytes);
+                tracing::info!(
+                    bytes_len = bytes.len(),
+                    strings = ?strs,
+                    "next_events: bplist payload (skip)"
+                );
                 continue;
             }
             let events = parse_kd_buf_records(&bytes);
@@ -478,6 +469,34 @@ fn parse_kd_buf_records(bytes: &[u8]) -> Vec<KdEvent> {
         offset += RECORD_SIZE;
     }
     events
+}
+
+/// Pull every String found anywhere in the bplist's value tree. Used
+/// to surface human-readable diagnostics ("notice"/"error"/"kperf is
+/// already owned by another session"/etc.) from coreprofile's
+/// DTTapMessage wrapper, which ns_keyed_archive doesn't fully decode.
+fn scan_bplist_strings(bytes: &[u8]) -> Vec<String> {
+    let Ok(v) = plist::Value::from_reader(std::io::Cursor::new(bytes)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_strings(&v, &mut out);
+    out
+}
+
+fn collect_strings(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => {
+            // Skip NSKeyedArchive scaffolding so the signal isn't
+            // drowned by '$classname', 'NS.objects', etc.
+            if !s.starts_with('$') && !s.starts_with("NS.") && !s.is_empty() {
+                out.push(s.clone());
+            }
+        }
+        Value::Array(arr) => arr.iter().for_each(|i| collect_strings(i, out)),
+        Value::Dictionary(d) => d.values().for_each(|i| collect_strings(i, out)),
+        _ => {}
+    }
 }
 
 /// Generate an upper-case UUID-4 string — used as the `uuid` field
