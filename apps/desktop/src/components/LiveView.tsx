@@ -166,6 +166,11 @@ export function LiveView({
     if (!selected || !targetPkg) return
     setNotice(null)
     setMarkers([])
+    // Clear the previous recording's startup readout so the row
+    // shows "等待录制" while the new measurement runs (~1-2s on iOS).
+    // Without this, the user would briefly see the previous value
+    // (e.g. a hot 80ms) while the cold measurement is in flight.
+    setAutoStartup(null)
     try {
       const result = await startSession(
         selected.id,

@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react'
 import { Tooltip } from '@arco-design/web-react'
 import { Info } from 'lucide-react'
 import { type StartupMode } from '@/lib/ipc'
@@ -53,18 +52,18 @@ function StartupReadout({
 }: {
   autoStartup: { mode: StartupMode; total_ms: number } | null
 }) {
-  const [value, setValue] = useState<{ mode: StartupMode; total_ms: number } | null>(null)
-
-  // Mirror each new auto-measurement (from start_session response)
-  // into the row. Reference equality on `autoStartup` is enough —
-  // LiveView creates a fresh object per Start.
-  useEffect(() => {
-    if (autoStartup) setValue(autoStartup)
-  }, [autoStartup])
-
-  const valueText = value == null ? '—' : `${value.total_ms} ms`
+  // Pure display — render straight from the prop. Previous version
+  // mirrored into local state, which got stuck on the first-recording
+  // value after the user did a hot start then a cold start in the
+  // same session window (the second start's autoStartup reference
+  // updated the prop but the local-state useEffect didn't refresh).
+  const valueText = autoStartup == null ? '—' : `${autoStartup.total_ms} ms`
   const typeText =
-    value == null ? '等待录制' : value.mode === 'cold' ? '冷启动' : '热启动'
+    autoStartup == null
+      ? '等待录制'
+      : autoStartup.mode === 'cold'
+        ? '冷启动'
+        : '热启动'
   const hint =
     '点击「录制」时自动测量。' +
     '若 app 未在跑(后台或被杀)记为冷启动,在跑(前台或后台)记为热启动。' +
