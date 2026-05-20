@@ -415,14 +415,15 @@ function SessionDetail({ session }: { session: SessionInfo }) {
           wallStartMs={session.wall_start_ms}
         />
       )}
-      {metricsSelection.has('cpu_usage') && (
-        <StaticCpuChart
-          points={total ?? []}
-          appPoints={appCpu ?? []}
-          markers={markerControls}
-          wallStartMs={session.wall_start_ms}
-        />
-      )}
+      {metricsSelection.has('cpu_usage') &&
+        ((total ?? []).length > 0 || (appCpu ?? []).length > 0) && (
+          <StaticCpuChart
+            points={total ?? []}
+            appPoints={appCpu ?? []}
+            markers={markerControls}
+            wallStartMs={session.wall_start_ms}
+          />
+        )}
       {metricsSelection.has('cpu_core') && (cores ?? []).length > 0 && (
         <StaticPerCoreChart
           rows={cores ?? []}
