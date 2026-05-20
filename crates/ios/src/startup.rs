@@ -91,14 +91,31 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
     // roughly at "first frame committed". Bounded by a sanity check
     // (timestamp within ~5s of mti, to ignore misaligned-byte
     // garbage in pre-launch V3-header chunks).
-    let watch_deadline = Instant::now() + Duration::from_secs(5);
+    let launch_wall = Instant::now();
+    let hard_deadline = launch_wall + Duration::from_secs(5);
+    // On a healthy device the FIRST real kdebug batch (the V3
+    // stackshot + schema, ~970KB) arrives within ~300ms of
+    // launch_app returning. If 1.5s pass with nothing but the
+    // initial cc/tv/tc ack, the device's kperf is in a wedged state
+    // (we observed this after one previous successful measurement
+    // in the same mperf process; the device sends no explicit
+    // notice — just silence). Bail fast so the UI shows a clear
+    // error instead of spinning for 5s.
+    let stream_alive_deadline = launch_wall + Duration::from_millis(1500);
     let mut events_seen: u64 = 0;
     let mut last_2b_mach: Option<u64> = None;
-    // 5s of ticks at our (numer/denom). Anything beyond this is
-    // misalignment.
     let max_ticks = (5_000_000_000u128 * mti.denom as u128 / mti.numer as u128) as u64;
     loop {
-        let remaining = watch_deadline.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        if events_seen == 0 && now >= stream_alive_deadline {
+            let _ = cp.stop().await;
+            anyhow::bail!(
+                "kperf appears wedged on the device (no kdebug data 1.5s after launch). \
+                 This is a known iOS 26 issue with consecutive coreprofile sessions — \
+                 restart mperf to reset, or wait ~30s and retry"
+            );
+        }
+        let remaining = hard_deadline.saturating_duration_since(now);
         if remaining.is_zero() {
             break;
         }
@@ -110,10 +127,8 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
         {
             Ok(Ok(events)) => events,
             Ok(Err(e)) => return Err(e),
-            // 400ms of silence after seeing some events → stream is
-            // quiet, launch is done.
             Err(_) if last_2b_mach.is_some() => break,
-            Err(_) => continue, // no events yet, keep waiting
+            Err(_) => continue,
         };
         events_seen += events.len() as u64;
         for ev in &events {
@@ -132,10 +147,9 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
         }
     }
     let last_ts = last_2b_mach.ok_or_else(|| {
-        let _ = ();
         anyhow!(
             "no UIKit kdebug events (class 0x2B) seen after launch in 5s ({events_seen} total \
-             events received) — kdf2 filter likely wasn't applied; PerfDog parity blocked"
+             events received) — likely a transient device-side issue, retry"
         )
     })?;
     let delta = last_ts - mti.mach_absolute_time;
