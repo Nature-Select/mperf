@@ -1,31 +1,29 @@
 //! Custom DTX channel for `com.apple.instruments.server.services.coreprofilesessiontap`.
 //!
-//! Bypasses `idevice::RemoteServerClient` because that crate's shared
-//! reader task calls `ns_keyed_archive::decode::from_bytes` on every
-//! payload and propagates the error. The coreprofile channel pushes
-//! raw kperf/kdebug ring-buffer bytes (NOT a plist) and would crash
-//! the reader on the first push, taking down all other channels on
-//! that RemoteServerClient with it.
+//! Bypasses `idevice::RemoteServerClient` for this one channel
+//! because that crate's shared reader task calls
+//! `ns_keyed_archive::decode::from_bytes` on every payload and
+//! propagates the error. The coreprofile channel pushes raw
+//! kperf/kdebug ring-buffer bytes (NOT a plist) and would crash the
+//! reader on the first push, taking down all other channels on that
+//! RemoteServerClient with it.
 //!
-//! We open a dedicated dtservicehub connection, do the bare-minimum
-//! DTX handshake by hand, and route NSKeyedArchive decoding ourselves
-//! per-message instead of unconditionally.
+//! Design: this struct owns ONE dtservicehub transport dedicated to
+//! the coreprofile channel. The only DTX RPC we wait for a reply on
+//! is the initial `_requestChannelWithCode:identifier:` mount; once
+//! the channel is mounted, `setConfig:` and `start` are sent
+//! fire-and-forget (matching pymobiledevice3's convention), and the
+//! read path becomes a pure consumer of kdebug pushes.
 //!
-//! What this gives us: a stream of `KdEvent`s, where each event is the
-//! 64-byte `kd_buf` Apple emits per kernel-tracepoint hit. App-launch
-//! phases (Dyld init, UIKit init, didFinishLaunching, scene attach,
-//! Initial Frame Rendering) all show up as events with specific
-//! class/subclass codes on this stream. `Initial Frame Rendering END`
-//! is `debug_id == 0x31C00506` and is the marker PerfDog's iOS "App
-//! Launch" timer ends on.
+//! Other DTX needs (machTimeInfo, processcontrol, sysmontap) run on
+//! their own idevice `RemoteServerClient` transports so they don't
+//! compete with the kdebug push firehose on this one's read path.
 //!
 //! Protocol reference: pymobiledevice3's `core_profile_session_tap.py`
-//! and py-ios-device's `app_lifecycle.py` / `kd_buf_parser.py`. Both
-//! are AGPL/GPL — we used them as wire-format documentation, NOT as
-//! copyable code. The numeric constants (kdf2 filters, debug_id
-//! values, kd_buf field layout) are reproduced verbatim because
-//! they're not copyrightable: they're Apple kernel-debug API
-//! constants.
+//! and py-ios-device's `app_lifecycle.py` / `kd_buf_parser.py`. We
+//! used them as wire-format documentation, NOT as copyable code. The
+//! numeric constants (kdf2 filter, debug_id, kd_buf field layout)
+//! are Apple kernel-debug API constants and aren't copyrightable.
 
 use crate::connect;
 use anyhow::{anyhow, Context, Result};
@@ -40,7 +38,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SERVICE_CORE_PROFILE: &str = "com.apple.instruments.server.services.coreprofilesessiontap";
-const SERVICE_DEVICEINFO: &str = "com.apple.instruments.server.services.deviceinfo";
 const SERVICE_DTSERVICEHUB: &str = "com.apple.instruments.dtservicehub";
 
 /// Apple kdebug debug_id for "Initial Frame Rendering END" — class
@@ -49,10 +46,9 @@ const SERVICE_DTSERVICEHUB: &str = "com.apple.instruments.dtservicehub";
 /// app launch right after the first frame is committed to the display.
 pub const FIRST_FRAME_END_DEBUG_ID: u32 = 0x31C00506;
 
-/// Apple kdebug debug_id masks (from `bsd/sys/kdebug.h`). Most of
-/// these are only used by the (not-yet-implemented) phase-breakdown
-/// path — kept here so the constants live next to the bit-layout
-/// they describe.
+/// Apple kdebug debug_id masks (from `bsd/sys/kdebug.h`). Kept here
+/// next to the bit-layout they describe; phase-breakdown will use the
+/// helper methods below.
 #[allow(dead_code)]
 const KDBG_CLASS_MASK: u32 = 0xff000000;
 #[allow(dead_code)]
@@ -63,9 +59,7 @@ const KDBG_SUBCLASS_MASK: u32 = 0x00ff0000;
 const KDBG_SUBCLASS_OFFSET: u32 = 16;
 
 /// One kernel-trace event. 64-byte `kd_buf` record straight off the
-/// wire. `timestamp_mach` is in device mach ticks; convert via
-/// `MachTimeInfo`. Fields `args`/`tid`/`cpuid` aren't read yet —
-/// phase-breakdown will use them.
+/// wire. `timestamp_mach` is in device mach ticks.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct KdEvent {
@@ -100,19 +94,25 @@ impl MachTimeInfo {
     }
 }
 
-/// DTX-level kdebug streamer with a tolerant message reader.
+/// Coreprofile DTX channel — opens its own transport, mounts the
+/// channel, starts the kdebug stream, and surfaces events.
 pub struct CoreProfileSessionRaw {
     stream: Box<dyn ReadWrite>,
     next_msg_id: u32,
-    next_channel: i32,
-    /// Mounted coreprofile channel code (server sends pushes on this).
     coreprofile_channel: i32,
 }
 
 impl CoreProfileSessionRaw {
-    /// Open a fresh CoreDeviceProxy/RSD/dtservicehub stack on its own
-    /// dedicated transport. Each instance burns one TCP connection.
-    pub async fn connect(udid: &str) -> Result<Self> {
+    /// Open transport, mount coreprofile channel, send setConfig +
+    /// start. On return the device is streaming kdebug events.
+    ///
+    /// `mount_timeout` bounds how long we wait for the channel-mount
+    /// reply. If the device never replies (very rare — usually a
+    /// transport-level failure) we surface that as an error rather
+    /// than hang. setConfig and start are fire-and-forget per
+    /// pymobiledevice3's convention; if they're rejected, we find
+    /// out via "no events for 15s" later.
+    pub async fn start(udid: &str) -> Result<Self> {
         let provider = connect::provider_for(udid).await.context("provider_for")?;
         let proxy = CoreDeviceProxy::connect(&*provider)
             .await
@@ -143,18 +143,41 @@ impl CoreProfileSessionRaw {
         let mut s = Self {
             stream,
             next_msg_id: 0,
-            next_channel: 1,
             coreprofile_channel: 0,
         };
-        s.consume_initial_capabilities().await?;
+
+        // Bounded: device should publish capabilities < 2s; mount
+        // reply should arrive < 2s. Hangs here are protocol-level
+        // bugs we want to surface, not silently wait on.
+        tokio::time::timeout(Duration::from_secs(5), s.consume_initial_capabilities())
+            .await
+            .map_err(|_| anyhow!("timed out waiting for _notifyOfPublishedCapabilities"))?
+            .context("consume initial capabilities")?;
+
+        let ch = tokio::time::timeout(
+            Duration::from_secs(5),
+            s.mount_channel_correlated(SERVICE_CORE_PROFILE),
+        )
+        .await
+        .map_err(|_| anyhow!("timed out mounting coreprofile channel"))?
+        .context("mount coreprofile")?;
+        s.coreprofile_channel = ch;
+        tracing::debug!(ch, "coreprofile channel mounted");
+
+        // setConfig: + start — fire-and-forget. We don't read the
+        // bplist ack here; if it arrives, our next_events loop will
+        // skip it (starts_with("bplist") filter).
+        s.send_set_config().await.context("send setConfig")?;
+        s.send_start().await.context("send start")?;
+        tracing::debug!("coreprofile streaming started");
+
         Ok(s)
     }
 
-    /// The device opens DTX with an unsolicited
-    /// `_notifyOfPublishedCapabilities:` push on channel 0. Read it
-    /// and discard — we don't need the capability list.
     async fn consume_initial_capabilities(&mut self) -> Result<()> {
-        let _ = self.read_message().await.context("initial capabilities")?;
+        // First push on channel 0 is _notifyOfPublishedCapabilities:.
+        // We read once and discard.
+        let _msg = self.read_lenient().await?;
         Ok(())
     }
 
@@ -163,126 +186,53 @@ impl CoreProfileSessionRaw {
         self.next_msg_id
     }
 
-    fn next_channel_code(&mut self) -> i32 {
-        let c = self.next_channel;
-        self.next_channel += 1;
-        c
-    }
-
-    /// Send a method invocation on the given channel and (if
-    /// expect_reply) wait for the correlated reply.
-    async fn call_method(
-        &mut self,
-        channel: i32,
-        selector: Option<&str>,
-        args: Option<Vec<AuxValue>>,
-        expect_reply: bool,
-    ) -> Result<LenientMessage> {
-        let identifier = self.next_identifier();
-        let mheader = MessageHeader::new(0, 1, identifier, 0, channel, expect_reply);
-        let pheader = PayloadHeader::method_invocation();
-        let aux = args.map(Aux::from_values);
-        let data = selector.map(|s| Value::String(s.into()));
-        let msg = Message::new(mheader, pheader, aux, data);
-        let bytes = msg.serialize();
-        self.stream
-            .write_all(&bytes)
+    /// Mount channel and wait for the reply ack. This is the ONLY
+    /// place we correlate by identifier — all other RPCs on this
+    /// transport are fire-and-forget.
+    async fn mount_channel_correlated(&mut self, identifier: &str) -> Result<i32> {
+        // Channel codes for locally-opened channels start at 1.
+        let code: i32 = 1;
+        let msg_id = self.next_identifier();
+        let args = vec![
+            AuxValue::U32(code as u32),
+            AuxValue::Array(
+                ns_keyed_archive::encode::encode_to_bytes(Value::String(identifier.into()))
+                    .map_err(|e| anyhow!("encode channel identifier: {e}"))?,
+            ),
+        ];
+        self.send_message(0, msg_id, Some("_requestChannelWithCode:identifier:"), Some(args), true)
             .await
-            .map_err(|e| anyhow!("dtx write: {e}"))?;
+            .context("send channel-mount RPC")?;
 
-        if !expect_reply {
-            // Pseudo-reply: return an empty placeholder.
-            return Ok(LenientMessage::placeholder());
-        }
-
-        // Read until we get a reply on the matching identifier.
+        // Loop until we get a reply with matching identifier and a
+        // non-zero conversation_index (idevice's convention for
+        // server replies vs server pushes).
         loop {
-            let reply = self.read_message().await?;
-            if reply.identifier == identifier && reply.conversation_index != 0 {
-                return Ok(reply);
+            let reply = self.read_lenient().await?;
+            if reply.identifier == msg_id && reply.conversation_index != 0 {
+                tracing::debug!(msg_id, "channel mount reply received");
+                return Ok(code);
             }
-            tracing::debug!(
-                identifier,
+            tracing::trace!(
+                msg_id,
                 got_id = reply.identifier,
                 got_conv = reply.conversation_index,
-                got_channel = reply.channel,
-                "ignoring intermediate DTX message"
+                got_chan = reply.channel,
+                "discarding pre-mount message"
             );
         }
     }
 
-    /// Mount a DTX service channel. Returns the local channel code.
-    async fn mount_channel(&mut self, identifier: &str) -> Result<i32> {
-        let code = self.next_channel_code();
-        let args = vec![
-            AuxValue::U32(code as u32),
-            AuxValue::Array(
-                ns_keyed_archive_encode_string(identifier)
-                    .context("encode channel identifier as NSKeyedArchive")?,
-            ),
-        ];
-        let _ = self
-            .call_method(0, Some("_requestChannelWithCode:identifier:"), Some(args), true)
-            .await
-            .with_context(|| format!("mount channel {identifier}"))?;
-        Ok(code)
-    }
-
-    /// Fetch `(mach_absolute_time, numer, denom)` from
-    /// `deviceinfo.machTimeInfo`. Mounts a temporary channel, asks,
-    /// drops. `mach_absolute_time` is the device's mach clock at the
-    /// moment the device processed the RPC — use as t0 for converting
-    /// kdebug timestamps via `ticks_delta_to_ns`.
-    pub async fn fetch_mach_time_info(&mut self) -> Result<MachTimeInfo> {
-        let ch = self.mount_channel(SERVICE_DEVICEINFO).await?;
-        let reply = self
-            .call_method(ch, Some("machTimeInfo"), None, true)
-            .await
-            .context("call machTimeInfo")?;
-        let data = reply
-            .decoded_data
-            .ok_or_else(|| anyhow!("machTimeInfo: empty reply"))?;
-        let arr = data
-            .as_array()
-            .ok_or_else(|| anyhow!("machTimeInfo: reply not Array: {data:?}"))?;
-        let mach_absolute_time = arr
-            .first()
-            .and_then(value_as_u64)
-            .ok_or_else(|| anyhow!("machTimeInfo[0] not unsigned: {arr:?}"))?;
-        let numer = arr
-            .get(1)
-            .and_then(value_as_u64)
-            .ok_or_else(|| anyhow!("machTimeInfo[1] not unsigned: {arr:?}"))? as u32;
-        let denom = arr
-            .get(2)
-            .and_then(value_as_u64)
-            .ok_or_else(|| anyhow!("machTimeInfo[2] not unsigned: {arr:?}"))? as u32;
-        Ok(MachTimeInfo {
-            mach_absolute_time,
-            numer,
-            denom,
-        })
-    }
-
-    /// Mount the coreprofile channel and push the default kdebug
-    /// allow-all filter config (`kdf2 = [0xFFFFFFFF]`). After this the
-    /// device knows what to capture but hasn't started yet.
-    ///
-    /// Config matches pymobiledevice3's defaults: `rp=100` (recording
-    /// priority), `bm=0` (buffer mode), `csd=128` (callstack depth),
-    /// `tk=3` (kind), `ta=[[3],[0],[2],[1,1,0]]` (actions). `kdf2` is
-    /// the kdebug class/subclass allow-list; `{0xFFFFFFFF}` is "all
-    /// classes" which is more events than we need but avoids worrying
-    /// about NSSet encoding (plist::Value has no Set variant; an
-    /// allow-list of one element is small enough to send as Array).
-    pub async fn set_config(&mut self) -> Result<()> {
-        let ch = self.mount_channel(SERVICE_CORE_PROFILE).await?;
-        self.coreprofile_channel = ch;
-
+    async fn send_set_config(&mut self) -> Result<()> {
+        let ch = self.coreprofile_channel;
         let mut tc_entry = Dictionary::new();
+        // kdf2 = [0xFFFFFFFF] = "all kdebug classes". pymobiledevice3
+        // sends this as a Python set (NSSet); we send Array. Device
+        // appears to accept either — if not, we'll see no events in
+        // the 15s window and know to dig further.
         tc_entry.insert(
             "kdf2".into(),
-            Value::Array(vec![Value::Integer((0xFFFFFFFFu64 as i64).into())]),
+            Value::Array(vec![Value::Integer((0xFFFFFFFFu32 as i64).into())]),
         );
         tc_entry.insert("csd".into(), Value::Integer(128i64.into()));
         tc_entry.insert("tk".into(), Value::Integer(3i64.into()));
@@ -299,10 +249,7 @@ impl CoreProfileSessionRaw {
                 ]),
             ]),
         );
-        tc_entry.insert(
-            "uuid".into(),
-            Value::String(uuid_string()),
-        );
+        tc_entry.insert("uuid".into(), Value::String(uuid_string()));
 
         let mut config = Dictionary::new();
         config.insert("rp".into(), Value::Integer(100i64.into()));
@@ -310,23 +257,16 @@ impl CoreProfileSessionRaw {
         config.insert("tc".into(), Value::Array(vec![Value::Dictionary(tc_entry)]));
 
         let args = vec![AuxValue::archived_value(Value::Dictionary(config))];
-        let _ = self
-            .call_method(ch, Some("setConfig:"), Some(args), true)
+        let msg_id = self.next_identifier();
+        self.send_message(ch, msg_id, Some("setConfig:"), Some(args), false)
             .await
-            .context("setConfig")?;
-        Ok(())
     }
 
-    pub async fn start(&mut self) -> Result<()> {
+    async fn send_start(&mut self) -> Result<()> {
         let ch = self.coreprofile_channel;
-        if ch == 0 {
-            return Err(anyhow!("coreprofile channel not mounted (call set_config first)"));
-        }
-        let _ = self
-            .call_method(ch, Some("start"), None, true)
+        let msg_id = self.next_identifier();
+        self.send_message(ch, msg_id, Some("start"), None, false)
             .await
-            .context("start")?;
-        Ok(())
     }
 
     pub async fn stop(&mut self) -> Result<()> {
@@ -334,53 +274,56 @@ impl CoreProfileSessionRaw {
         if ch == 0 {
             return Ok(());
         }
-        // Best-effort, don't block on reply.
-        let _ = self.call_method(ch, Some("stop"), None, false).await;
+        let msg_id = self.next_identifier();
+        let _ = self
+            .send_message(ch, msg_id, Some("stop"), None, false)
+            .await;
         Ok(())
     }
 
-    /// Drain & ignore queued kdebug pushes until none arrive within
-    /// `quiet_for`. Used to clear the initial backlog of system events
-    /// before the launch we care about.
-    pub async fn drain_until_quiet(&mut self, quiet_for: Duration) -> Result<()> {
-        loop {
-            match tokio::time::timeout(quiet_for, self.read_message()).await {
-                Ok(Ok(_)) => continue,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Ok(()), // timeout = quiet
-            }
-        }
+    /// Send one outgoing DTX message. Doesn't wait for any reply.
+    async fn send_message(
+        &mut self,
+        channel: i32,
+        identifier: u32,
+        selector: Option<&str>,
+        args: Option<Vec<AuxValue>>,
+        expects_reply: bool,
+    ) -> Result<()> {
+        let mheader = MessageHeader::new(0, 1, identifier, 0, channel, expects_reply);
+        let pheader = PayloadHeader::method_invocation();
+        let aux = args.map(Aux::from_values);
+        let data = selector.map(|s| Value::String(s.into()));
+        let msg = Message::new(mheader, pheader, aux, data);
+        let bytes = msg.serialize();
+        self.stream
+            .write_all(&bytes)
+            .await
+            .map_err(|e| anyhow!("dtx write: {e}"))?;
+        Ok(())
     }
 
-    /// Read one DTX message off the wire and return whatever payload
-    /// it carries, parsed loosely (decode plist data if it looks like
-    /// bplist, otherwise expose `raw_data` only).
-    pub async fn read_message(&mut self) -> Result<LenientMessage> {
-        read_lenient(&mut self.stream).await
-    }
-
-    /// Read the next batch of kdebug events that arrives on the
-    /// coreprofile channel. Skips bplist acks/notices (which would
-    /// have decoded_data populated) and stackshot kcdata blobs.
+    /// Read the next batch of kdebug events. Skips:
+    ///   - replies on channel 0 (mount/etc — already past that phase)
+    ///   - bplist payloads (acks, notices)
+    ///   - stackshot kcdata blobs
+    /// Returns when we get a payload that looks like a kd_buf batch.
     pub async fn next_events(&mut self) -> Result<Vec<KdEvent>> {
         loop {
-            let msg = self.read_message().await?;
-            if msg.channel != self.coreprofile_channel {
-                continue;
-            }
+            let msg = self.read_lenient().await?;
             let Some(bytes) = msg.raw_data else { continue };
             if bytes.is_empty() {
                 continue;
             }
-            // Stackshot kcdata header (KCDATA_BUFFER_BEGIN_STACKSHOT
-            // little-endian) — not events, skip.
+            // Stackshot kcdata (KCDATA_BUFFER_BEGIN_STACKSHOT little-
+            // endian = 0x59A25807) — sent once per tap, ignore.
             if bytes.starts_with(&[0x07, b'X', 0xa2, b'Y']) {
+                tracing::trace!(bytes_len = bytes.len(), "skipping stackshot kcdata");
                 continue;
             }
-            // bplist acks/notices already decoded into msg.decoded_data;
-            // raw_data is still the bplist bytes but they're not
-            // kdebug records. Skip them too.
+            // bplist acks/notices — kdebug data isn't bplist.
             if bytes.starts_with(b"bplist") {
+                tracing::trace!(bytes_len = bytes.len(), "skipping bplist payload");
                 continue;
             }
             let events = parse_kd_buf_records(&bytes);
@@ -390,37 +333,23 @@ impl CoreProfileSessionRaw {
             return Ok(events);
         }
     }
-}
 
-/// One DTX message with optionally-decoded plist data. Same as
-/// idevice's Message but doesn't fail the read on NSKeyedArchive
-/// decode error — for kdebug raw pushes `decoded_data` stays None
-/// while `raw_data` holds the bytes.
-#[derive(Debug)]
-pub struct LenientMessage {
-    pub identifier: u32,
-    pub conversation_index: u32,
-    pub channel: i32,
-    pub raw_data: Option<Vec<u8>>,
-    pub decoded_data: Option<Value>,
-}
-
-impl LenientMessage {
-    fn placeholder() -> Self {
-        Self {
-            identifier: 0,
-            conversation_index: 0,
-            channel: 0,
-            raw_data: None,
-            decoded_data: None,
-        }
+    /// Read one DTX message off the wire with tolerant payload
+    /// decoding (bplist payloads decoded; everything else kept as
+    /// raw bytes).
+    async fn read_lenient(&mut self) -> Result<LenientMessage> {
+        read_lenient(&mut self.stream).await
     }
 }
 
-/// Reads one DTX message, mirroring `idevice::Message::from_reader`'s
-/// header logic but with tolerant payload decoding: bplist payloads
-/// are decoded into `decoded_data`; non-bplist payloads (kdebug raw
-/// pushes) leave `decoded_data=None` and surface via `raw_data`.
+#[derive(Debug)]
+struct LenientMessage {
+    identifier: u32,
+    conversation_index: u32,
+    channel: i32,
+    raw_data: Option<Vec<u8>>,
+}
+
 async fn read_lenient<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<LenientMessage> {
     let mut packet_data: Vec<u8> = Vec::new();
     let (identifier, conversation_index, channel) = loop {
@@ -437,7 +366,7 @@ async fn read_lenient<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result
         let identifier = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
         let conversation_index = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
         let wire_channel = i32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
-        // Same channel sign convention as idevice: server-pushed
+        // Same channel sign convention as idevice — server-pushed
         // messages have conversation_index % 2 == 0 and the local
         // code is the negation of the wire code.
         let channel = if conversation_index.is_multiple_of(2) {
@@ -446,7 +375,6 @@ async fn read_lenient<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result
             wire_channel
         };
         if fragment_count > 1 && fragment_id == 0 {
-            // First fragment is header-only.
             continue;
         }
         let mut payload_buf = vec![0u8; length as usize];
@@ -484,24 +412,18 @@ async fn read_lenient<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result
     } else {
         Some(data_bytes.to_vec())
     };
-    let decoded_data = if data_bytes.starts_with(b"bplist") {
-        ns_keyed_archive::decode::from_bytes(data_bytes).ok()
-    } else {
-        None
-    };
 
     Ok(LenientMessage {
         identifier,
         conversation_index,
         channel,
         raw_data,
-        decoded_data,
     })
 }
 
-/// Parse a packed array of 64-byte `kd_buf` records. The live DTX
-/// stream has no V2/V3 header (those only appear in file-based
-/// dumps), so we just slice records straight out.
+/// Parse a packed array of 64-byte `kd_buf` records. Live DTX stream
+/// has no V2/V3 header (those only appear in file-based dumps), so
+/// we just slice records straight out.
 fn parse_kd_buf_records(bytes: &[u8]) -> Vec<KdEvent> {
     const RECORD_SIZE: usize = 64;
     let mut events = Vec::with_capacity(bytes.len() / RECORD_SIZE);
@@ -530,38 +452,21 @@ fn parse_kd_buf_records(bytes: &[u8]) -> Vec<KdEvent> {
     events
 }
 
-fn value_as_u64(v: &Value) -> Option<u64> {
-    match v {
-        Value::Integer(i) => i.as_unsigned(),
-        _ => None,
-    }
-}
-
-fn ns_keyed_archive_encode_string(s: &str) -> Result<Vec<u8>> {
-    ns_keyed_archive::encode::encode_to_bytes(Value::String(s.into()))
-        .map_err(|e| anyhow!("NSKeyedArchive encode: {e}"))
-}
-
-/// Generate an upper-case UUID-4 string — used by `setConfig:` to tag
-/// the trace config. Apple's parser cares about the format (uppercase
-/// hex with dashes); the value itself is opaque. Hand-rolled rather
-/// than pulling in the `uuid` crate for one string.
+/// Generate an upper-case UUID-4 string — used as the `uuid` field
+/// of the trace config. Apple's parser cares about the format
+/// (uppercase hex with dashes); the value itself is opaque.
 fn uuid_string() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    // Tiny xorshift-style mix on the nanoseconds for visual variation;
-    // doesn't need to be cryptographically random.
     let mut x = nanos.wrapping_mul(0x9E3779B97F4A7C15);
     let mut bytes = [0u8; 16];
     for b in bytes.iter_mut() {
         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         *b = (x >> 56) as u8;
     }
-    // Mark as version 4 / variant 1 per RFC 4122 — not strictly
-    // required but keeps the string shape Apple expects.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     format!(

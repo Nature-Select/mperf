@@ -2,34 +2,37 @@
 //!
 //! Cold start: coreprofilesessiontap DTX channel — same kdebug stream
 //! Xcode Instruments / PerfDog tap. We subscribe to kernel-debug
-//! events, launch the app, then time from the device's mach clock at
-//! launch dispatch to the `Initial Frame Rendering END` kdebug event
+//! events, anchor t0 via deviceinfo.machTimeInfo (separate transport
+//! so kdebug pushes don't compete with the RPC reply), launch the
+//! app, then look for the `Initial Frame Rendering END` kdebug event
 //! (debug_id = 0x31C00506). This matches PerfDog's top-line "App
 //! Launch" number (~200ms on warm hardware).
 //!
-//! Hot start: still RPC-only via processcontrol.launchApp. The
-//! coreprofile approach would also work, but the kdebug "first
-//! frame" event doesn't reliably fire on a UIScene re-attach (the
-//! path foregrounding takes); the RPC time is the closest single
+//! Hot start: RPC-only via processcontrol.launchApp. The kdebug
+//! first-frame event doesn't reliably fire on a UIScene re-attach
+//! (the path foregrounding takes); the RPC time is the closest single
 //! number we have for now.
 //!
 //! Foreground handling: same SpringBoard pre-step pattern. Without
 //! it, DTX-initiated launches on a foreground target can leave the
-//! device on a black screen because SpringBoard doesn't treat DTX
-//! launches as user-foreground intents.
+//! device on a black screen.
 
 use crate::connect;
 use crate::core_profile_session_raw::{
-    CoreProfileSessionRaw, FIRST_FRAME_END_DEBUG_ID,
+    CoreProfileSessionRaw, MachTimeInfo, FIRST_FRAME_END_DEBUG_ID,
 };
 use crate::launch::launch_app_with_options;
 use anyhow::{anyhow, Context, Result};
 use idevice::{
     core_device_proxy::CoreDeviceProxy,
-    dvt::{process_control::ProcessControlClient, remote_server::RemoteServerClient},
+    dvt::{
+        message::AuxValue, process_control::ProcessControlClient,
+        remote_server::RemoteServerClient,
+    },
     rsd::RsdHandshake,
     IdeviceService, ReadWrite,
 };
+use plist::Value;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
@@ -44,33 +47,27 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // --- coreprofilesessiontap on its own DTX connection ----------
-    // SEPARATE transport from processcontrol so the kdebug raw-bytes
-    // pushes don't interfere with the NSKeyedArchive-only protocol
-    // stream idevice's RemoteServerClient expects.
-    let mut cp = CoreProfileSessionRaw::connect(udid)
+    // Coreprofile streamer on its own dedicated transport. After
+    // .start() returns, the device is pushing kdebug events.
+    let mut cp = CoreProfileSessionRaw::start(udid)
         .await
-        .context("CoreProfileSessionRaw::connect")?;
-    cp.set_config().await.context("cp.set_config")?;
-    cp.start().await.context("cp.start")?;
-    // Drain initial stackshot + any pre-launch system events so the
-    // first thing we see in the post-launch loop is OUR app's launch.
-    cp.drain_until_quiet(Duration::from_millis(400))
-        .await
-        .context("drain pre-launch events")?;
+        .context("CoreProfileSessionRaw::start")?;
 
-    // --- processcontrol on its own DTX connection -----------------
+    // Separate transport for machTimeInfo + processcontrol. Doing
+    // these on the coreprofile transport would interleave the
+    // request/reply with kdebug pushes and we'd lose events to the
+    // discard path while waiting for replies.
     let mut remote_pc = build_dtx_remote(udid)
         .await
         .context("DTX session for processcontrol")?;
+    let mti = fetch_mach_time_info(&mut remote_pc)
+        .await
+        .context("machTimeInfo")?;
+    tracing::debug!(?mti, "anchored mach time");
+
     let mut pc = ProcessControlClient::new(&mut remote_pc)
         .await
         .context("ProcessControlClient::new")?;
-
-    // Anchor mach_t0 right before dispatching the launch RPC. The
-    // ~10-20ms machTimeInfo roundtrip is included in the reported
-    // number — known small inflation that's tolerable for a spike.
-    let mti = cp.fetch_mach_time_info().await.context("machTimeInfo")?;
 
     let _pid = pc
         .launch_app(
@@ -83,27 +80,37 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
         .await
         .with_context(|| format!("processcontrol.launchApp({bundle_id})"))?;
 
-    // Wait for the first-frame event. Bound at 15s so a missed
-    // 0x31C00506 (e.g. app has no UI) doesn't hang us forever.
+    // Look for 0x31C00506 with timestamp > mti.mach_absolute_time
+    // (to filter out stale events queued before mti was captured).
+    // Bound at 15s so a missed first-frame event doesn't hang us.
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut events_seen: u64 = 0;
     let total_ms = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             let _ = cp.stop().await;
             anyhow::bail!(
-                "no Initial Frame Rendering END (0x31C00506) event within 15s; device might \
-                 be throttled or the app might not have a UI"
+                "no Initial Frame Rendering END (0x31C00506) event within 15s after launch \
+                 ({events_seen} kdebug events seen); device might be throttled, the app may \
+                 not have a UI, or the kdf2 filter wasn't applied"
             );
         }
         let events = tokio::time::timeout(remaining, cp.next_events())
             .await
             .map_err(|_| anyhow!("kdebug stream timed out waiting for first-frame event"))??;
-        if let Some(ev) = events
-            .iter()
-            .find(|e| e.debug_id == FIRST_FRAME_END_DEBUG_ID)
-        {
-            let delta = ev.timestamp_mach.saturating_sub(mti.mach_absolute_time);
+        events_seen += events.len() as u64;
+        if let Some(ev) = events.iter().find(|e| {
+            e.debug_id == FIRST_FRAME_END_DEBUG_ID
+                && e.timestamp_mach > mti.mach_absolute_time
+        }) {
+            let delta = ev.timestamp_mach - mti.mach_absolute_time;
             let total_ns = mti.ticks_delta_to_ns(delta);
+            tracing::debug!(
+                events_seen,
+                delta_ticks = delta,
+                total_ns,
+                "cold start measured"
+            );
             break total_ns / 1_000_000;
         }
     };
@@ -113,9 +120,8 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
 }
 
 /// Hot start: bring an existing process forward without re-init.
-/// RPC-only — kdebug "first frame" event doesn't reliably fire on a
-/// foregrounding (the process is already running, no new dyld init,
-/// no fresh UIScene boot).
+/// RPC-only — kdebug first-frame event doesn't reliably fire on
+/// foregrounding.
 pub async fn measure_hot_start(udid: &str, bundle_id: &str) -> Result<StartupTiming> {
     if let Err(e) = launch_app_with_options(udid, "com.apple.springboard", false).await {
         tracing::debug!(error = %e, "hot start: SpringBoard pre-launch failed; continuing");
@@ -141,6 +147,60 @@ pub async fn measure_hot_start(udid: &str, bundle_id: &str) -> Result<StartupTim
         .with_context(|| format!("processcontrol.launchApp({bundle_id})"))?;
     Ok(StartupTiming {
         total_ms: t0.elapsed().as_millis() as u64,
+    })
+}
+
+/// Call `deviceinfo.machTimeInfo` and decode the
+/// `(mach_absolute_time, numer, denom)` tuple. Uses idevice's
+/// RemoteServerClient path because it correctly correlates the reply
+/// — we just need to bypass DeviceInfoClient (which doesn't expose
+/// this selector publicly) and call the channel directly.
+async fn fetch_mach_time_info(
+    remote: &mut RemoteServerClient<Box<dyn ReadWrite>>,
+) -> Result<MachTimeInfo> {
+    let mut ch = remote
+        .make_channel("com.apple.instruments.server.services.deviceinfo".to_string())
+        .await
+        .context("mount deviceinfo channel")?;
+    ch.call_method(
+        Some(Value::String("machTimeInfo".into())),
+        None::<Vec<AuxValue>>,
+        true,
+    )
+    .await
+    .context("call machTimeInfo")?;
+    let msg = ch.read_message().await.context("read machTimeInfo reply")?;
+    let data = msg
+        .data
+        .ok_or_else(|| anyhow!("machTimeInfo: empty reply"))?;
+    let arr = data
+        .as_array()
+        .ok_or_else(|| anyhow!("machTimeInfo: reply not Array: {data:?}"))?;
+    let mach_absolute_time = arr
+        .first()
+        .and_then(|v| match v {
+            Value::Integer(i) => i.as_unsigned(),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("machTimeInfo[0] not unsigned: {arr:?}"))?;
+    let numer = arr
+        .get(1)
+        .and_then(|v| match v {
+            Value::Integer(i) => i.as_unsigned(),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("machTimeInfo[1] not unsigned: {arr:?}"))? as u32;
+    let denom = arr
+        .get(2)
+        .and_then(|v| match v {
+            Value::Integer(i) => i.as_unsigned(),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("machTimeInfo[2] not unsigned: {arr:?}"))? as u32;
+    Ok(MachTimeInfo {
+        mach_absolute_time,
+        numer,
+        denom,
     })
 }
 
