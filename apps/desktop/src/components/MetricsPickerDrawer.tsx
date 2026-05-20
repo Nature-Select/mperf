@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Checkbox, Drawer, Input, Tag, Tooltip, Typography } from '@arco-design/web-react'
-import { Plus, Search } from 'lucide-react'
+import { Plus, Search, X } from 'lucide-react'
 import {
   CATEGORIES,
   DEFAULT_SELECTED_IDS,
@@ -70,16 +70,22 @@ export function MetricsPickerDrawer({ recording = false }: { recording?: boolean
         visible={open}
         onCancel={() => setOpen(false)}
         footer={null}
+        // We render our own close X inside the panel header so it
+        // shares the flex row with 重置 / counter / title and lines up
+        // cleanly. Arco's built-in X is absolutely positioned in the
+        // drawer's own header strip and can't be co-aligned with our
+        // body-level header.
+        closable={false}
         width={400}
         bodyStyle={{ padding: 0 }}
       >
-        <MetricsPickerPanel />
+        <MetricsPickerPanel onClose={() => setOpen(false)} />
       </Drawer>
     </>
   )
 }
 
-function MetricsPickerPanel() {
+function MetricsPickerPanel({ onClose }: { onClose: () => void }) {
   const { selected, toggle, setMany, commit } = useMetricsSelection()
   const [query, setQuery] = useState('')
 
@@ -136,6 +142,15 @@ function MetricsPickerPanel() {
             title="恢复默认选择"
           >
             重置
+          </button>
+          <button
+            type="button"
+            className={styles.headerClose}
+            onClick={onClose}
+            aria-label="关闭"
+            title="关闭"
+          >
+            <X size={14} />
           </button>
         </div>
         <Input

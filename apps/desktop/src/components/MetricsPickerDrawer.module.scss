@@ -90,10 +90,6 @@
   display: flex;
   align-items: center;
   gap: 10px;
-
-  // Reserve space on the right for Arco's built-in close X so the
-  // title row doesn't run into it on narrow drawer widths.
-  padding-right: 28px;
 }
 
 .headerReset {
@@ -108,6 +104,28 @@
 
   &:hover {
     background: var(--color-fill-2);
+  }
+}
+
+// Our own close X — replaces Arco's absolutely-positioned default so
+// it lives on the same flex row as title / counter / 重置 and aligns
+// cleanly with all of them.
+.headerClose {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-text-2);
+  cursor: pointer;
+  border-radius: 4px;
+
+  &:hover {
+    background: var(--color-fill-2);
+    color: var(--color-text-1);
   }
 }
 
