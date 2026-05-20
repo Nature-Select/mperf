@@ -344,14 +344,13 @@ impl CoreProfileSessionRaw {
         let _ = self
             .send_message(ch, msg_id, Some("stop"), None, false)
             .await;
-        // Drain & discard whatever the device pushes for 2s so kperf
+        // Drain & discard whatever the device pushes for ~4s so kperf
         // is fully shut down on the device side before we close the
         // socket. Without this, a second cold-start measurement
-        // within ~2-3s hits "_lockKPerf: could not lock kperf"
-        // (DTTapStatusMessage notice). 2s clears it on iOS 26.4.2
-        // on an iPhone 14; if not enough, surface as an error from
-        // the next attempt instead of waiting 5s.
-        let drain_deadline = std::time::Instant::now() + Duration::from_millis(2000);
+        // hits "_lockKPerf: could not lock kperf" (or the silent
+        // failure variant where the device just doesn't stream).
+        // 4s empirically clears it on iOS 26.4.2 / iPhone 14.
+        let drain_deadline = std::time::Instant::now() + Duration::from_millis(4000);
         loop {
             let remaining = drain_deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -453,18 +452,30 @@ impl CoreProfileSessionRaw {
                     }
                     None => {
                         let strs = scan_bplist_strings(&bytes);
-                        // The device sometimes pushes a DTTapStatusMessage
-                        // saying kperf can't be locked because it's still
-                        // owned by the previous session. Surface that as a
-                        // dedicated error instead of waiting 5s for events
-                        // that will never come.
-                        if let Some(notice) = strs
+                        // Surface any DTTapStatusMessage notice as a
+                        // dedicated error instead of letting the watch
+                        // loop wait 5s for events that will never come.
+                        // The wording varies (kperf-lock, "Failed to
+                        // start", "could not", etc.) so we key off
+                        // either the class name or the presence of a
+                        // `notice`/`error`/`status` field plus any
+                        // string that looks like a sentence (contains
+                        // a space, not all NSKeyedArchive scaffolding).
+                        let is_status = strs
                             .iter()
-                            .find(|s| s.contains("kperf") || s.contains("Failed to start"))
-                        {
+                            .any(|s| s == "DTTapStatusMessage");
+                        if is_status {
+                            let detail = strs
+                                .iter()
+                                .find(|s| s.contains(' ') && s.len() > 20)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    format!("status message: {strs:?}")
+                                });
                             return Err(anyhow!(
-                                "coreprofile rejected setConfig: {notice} \
-                                 (wait ~3s and retry — device-side kperf release is asynchronous)"
+                                "coreprofile rejected setConfig/start: {detail} \
+                                 (device-side kperf release is asynchronous — wait several \
+                                 seconds and retry)"
                             ));
                         }
                         tracing::info!(
