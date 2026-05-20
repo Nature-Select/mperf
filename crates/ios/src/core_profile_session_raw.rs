@@ -253,7 +253,11 @@ impl CoreProfileSessionRaw {
 
         let mut config = Dictionary::new();
         config.insert("rp".into(), Value::Integer(100i64.into()));
-        config.insert("bm".into(), Value::Integer(0i64.into()));
+        // bm=1 (py-ios-device's value) = continuous streaming. bm=0
+        // (pymobiledevice3's default for stackshot use) only gives us
+        // ONE batch of pre-buffered events and then stops, so launch
+        // events fired after `start` never arrive.
+        config.insert("bm".into(), Value::Integer(1i64.into()));
         config.insert("tc".into(), Value::Array(vec![Value::Dictionary(tc_entry)]));
 
         let args = vec![AuxValue::archived_value(Value::Dictionary(config))];
