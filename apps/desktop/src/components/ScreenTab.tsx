@@ -69,7 +69,7 @@ function StartupReadout({
     '若 app 未在跑(后台或被杀)记为冷启动,在跑(前台或后台)记为热启动。' +
     'Android 通过 am start -W TotalTime(kernel 测量到首帧);' +
     'iOS 冷启动通过 coreprofilesessiontap 的 kdebug 事件流估算首帧,热启动取 processcontrol launchApp RPC 时长。' +
-    'iOS 冷启动每个 mperf 进程生命周期只能测一次 — 想重测,停止录制后重新开始。'
+    'iOS 26 内核 kperf 锁释放需 ~30s,两次冷启动测量请间隔 30s 以上,否则会失败。'
 
   return (
     <div className={styles.startupSection}>

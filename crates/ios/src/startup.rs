@@ -1,34 +1,31 @@
 //! Cold / hot app-launch timing on iOS.
 //!
-//! Cold start: a long-lived coreprofile session (one per device,
-//! managed by `kdebug_supervisor`) continuously broadcasts kdebug
-//! events. For each measurement we:
-//!   1. Subscribe to the supervisor's broadcast channel — gives us
-//!      a fresh Receiver that sees every event from "now" forward.
-//!   2. Open a one-shot DTX transport for `deviceinfo.machTimeInfo`
-//!      + `processcontrol.launchApp`. mti gives us t0 in device
-//!      mach ticks. launchApp dispatches the launch.
-//!   3. Read events from the Receiver, filter to class 0x2B (UIKit
-//!      lifecycle, post-mti, sanity-bounded), and take the LATEST
-//!      timestamp seen within ~3s OR 400ms of quiet — that's the
-//!      end of the launch.
-//!   4. Drop the Receiver. The supervisor keeps draining; the next
-//!      measurement is just another subscribe + filter pass.
+//! Cold start: coreprofilesessiontap DTX channel — same kdebug
+//! stream Xcode Instruments / PerfDog tap. We anchor t0 via
+//! deviceinfo.machTimeInfo (separate transport so kdebug pushes
+//! don't compete with the RPC reply), launch the app via
+//! processcontrol, then look for the LAST class 0x2B (UIKit)
+//! kdebug event past t0 within ~2s. On iOS 26 the
+//! py-ios-device-documented `0x31C00506` first-frame marker
+//! doesn't fire; the last UIKit event is the closest proxy and
+//! lands inside the user-perceived launch window (matched
+//! PerfDog's 213ms in testing).
 //!
-//! Why class 0x2B (UIKit) as the "first frame" proxy: iOS 26 stopped
-//! emitting the py-ios-device-documented `0x31C00506` marker. The
-//! tail UIKit event lands right around when the first frame commits
-//! to the display, which matches PerfDog's top-line "App Launch"
-//! number in our testing (~190-210ms on an iPhone 14 / iOS 26.4.2,
-//! within 10ms of PerfDog's 213ms).
+//! The coreprofilesessiontap session is held in a per-UDID pool
+//! (`core_profile_session_raw::SESSIONS`) and reused across
+//! measurements — iOS 26 doesn't reliably re-acquire kperf when
+//! we tear down and reopen the channel, so we leave it streaming
+//! and just demarcate per-measurement windows by timestamp.
 //!
-//! Hot start: RPC-only via `processcontrol.launchApp`. The kdebug
-//! first-frame proxy doesn't reliably fire on a UIScene re-attach
-//! (the path foregrounding takes), so we just time the RPC.
+//! Hot start: RPC-only via processcontrol.launchApp. The kdebug
+//! first-frame event doesn't reliably fire on a UIScene re-attach
+//! (the path foregrounding takes); the RPC time is the closest
+//! single number we have for now.
 
 use crate::connect;
-use crate::core_profile_session_raw::MachTimeInfo;
-use crate::kdebug_supervisor::{self, KdebugSupervisor};
+use crate::core_profile_session_raw::{
+    acquire_session, invalidate_session, MachTimeInfo,
+};
 use crate::launch::launch_app_with_options;
 use anyhow::{anyhow, Context, Result};
 use idevice::{
@@ -41,9 +38,7 @@ use idevice::{
     IdeviceService, ReadWrite,
 };
 use plist::Value;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::broadcast::error::RecvError;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 pub struct StartupTiming {
@@ -51,33 +46,64 @@ pub struct StartupTiming {
 }
 
 pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTiming> {
-    // SpringBoard pre-step — moves the home screen forward so the
-    // upcoming kill+relaunch doesn't leave the device on a black
-    // screen (DTX launches don't always count as user-foreground
-    // intents to iOS 26 SpringBoard).
+    // Retry wrapper. iOS 26's kperf release after a previous session
+    // is asynchronous — the previous DTServiceHub child can take
+    // a few seconds to fully exit, during which a new acquire fails
+    // (sometimes with an explicit `_lockKPerf` notice, sometimes
+    // silently). We retry up to 3 times with growing backoff. On
+    // success, we return the value. On all-failures, we return the
+    // last error.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match measure_cold_start_once(udid, bundle_id).await {
+            Ok(t) => {
+                if attempt > 1 {
+                    tracing::info!(attempt, "measure_cold_start: succeeded on retry");
+                }
+                return Ok(t);
+            }
+            Err(e) => {
+                if attempt < MAX_ATTEMPTS {
+                    // 500ms / 1000ms backoff — most failures are
+                    // either stale-stream EOF (needs no wait, just
+                    // a fresh transport) or kperf-release-in-progress
+                    // (sub-second on iOS 26.4.2 in practice). Old
+                    // 2s/4s was overkill.
+                    let backoff = Duration::from_millis(500 * attempt as u64);
+                    tracing::warn!(
+                        attempt,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %e,
+                        "measure_cold_start: attempt failed, sleeping then retrying"
+                    );
+                    last_err = Some(e);
+                    tokio::time::sleep(backoff).await;
+                } else {
+                    last_err = Some(e);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("measure_cold_start: exhausted retries")))
+}
+
+async fn measure_cold_start_once(udid: &str, bundle_id: &str) -> Result<StartupTiming> {
+    tracing::info!(bundle_id, "measure_cold_start_once begin");
     if let Err(e) = launch_app_with_options(udid, "com.apple.springboard", false).await {
         tracing::info!(error = %e, "cold start: SpringBoard pre-launch failed; continuing");
     } else {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    tracing::info!("cold start: SpringBoard prep done");
 
-    // Acquire the persistent kdebug supervisor. If it's already
-    // running (this isn't the first measurement on this device since
-    // mperf started), this is a near-instant Arc clone. If not, we
-    // pay ~300ms for the transport open + setConfig + start.
-    tracing::info!("cold start: acquiring kdebug supervisor");
-    let supervisor: Arc<KdebugSupervisor> = kdebug_supervisor::acquire(udid)
-        .await
-        .context("kdebug_supervisor::acquire")?;
+    let session = acquire_session(udid).await?;
+    let mut cp = session.lock().await;
+    tracing::info!("cold start: coreprofile session acquired");
 
-    // Subscribe AFTER the supervisor is alive so we don't miss the
-    // events from our launch. Broadcast lags would happen if the
-    // channel filled up, but we read in a tight loop below.
-    let mut rx = supervisor.subscribe();
-
-    // Separate transport for machTimeInfo + processcontrol. Must
-    // NOT live on the coreprofile transport — that one is owned by
-    // the supervisor's drain task.
+    // Separate transport for machTimeInfo + processcontrol — must
+    // not interleave with the kdebug push stream on the coreprofile
+    // transport (its reply correlation would eat events otherwise).
     let mut remote_pc = build_dtx_remote(udid)
         .await
         .context("DTX session for processcontrol")?;
@@ -89,6 +115,7 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
     let mut pc = ProcessControlClient::new(&mut remote_pc)
         .await
         .context("ProcessControlClient::new")?;
+    tracing::info!("cold start: dispatching launch_app RPC");
 
     let pid = pc
         .launch_app(
@@ -100,87 +127,26 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
         )
         .await
         .with_context(|| format!("processcontrol.launchApp({bundle_id})"))?;
-    tracing::info!(pid, "cold start: launch_app returned, scanning kdebug stream for last 0x2B event");
+    tracing::info!(pid, "cold start: launch_app returned, watching kdebug stream");
 
-    // Find the LATEST class-0x2B event timestamp > mti within ~3s
-    // OR 400ms of quiet after we've seen at least one. Bounded with
-    // a sanity cap of 5s past mti (in mach ticks) to reject any
-    // misaligned-byte garbage.
-    let max_ticks = (5_000_000_000u128 * mti.denom as u128 / mti.numer as u128) as u64;
-    let watch_deadline = Instant::now() + Duration::from_secs(3);
-    let mut last_2b_mach: Option<u64> = None;
-    let mut events_seen: u64 = 0;
-    let mut lagged_count: u64 = 0;
-    loop {
-        let now = Instant::now();
-        let remaining = watch_deadline.saturating_duration_since(now);
-        if remaining.is_zero() {
-            tracing::warn!(events_seen, lagged_count, "cold start: hit 3s deadline");
-            break;
+    let result = cp
+        .capture_post_launch_timestamp(&mti, Duration::from_secs(3))
+        .await;
+
+    let last_ts = match result {
+        Ok(ts) => ts,
+        Err(e) => {
+            tracing::warn!(error = %e, "measure_cold_start: capture failed; invalidating session so the next attempt rebuilds the transport");
+            drop(cp);
+            invalidate_session(udid).await;
+            return Err(e);
         }
-        // 400ms quiet timeout AFTER we've seen events = launch ended.
-        let recv_timeout = if last_2b_mach.is_some() {
-            Duration::from_millis(400).min(remaining)
-        } else {
-            remaining
-        };
-        match tokio::time::timeout(recv_timeout, rx.recv()).await {
-            Ok(Ok(ev)) => {
-                events_seen += 1;
-                if ev.class_code() != 0x2b {
-                    continue;
-                }
-                if ev.timestamp_mach <= mti.mach_absolute_time {
-                    continue;
-                }
-                let delta = ev.timestamp_mach - mti.mach_absolute_time;
-                if delta > max_ticks {
-                    continue;
-                }
-                last_2b_mach = Some(
-                    last_2b_mach.map_or(ev.timestamp_mach, |prev| prev.max(ev.timestamp_mach)),
-                );
-            }
-            Ok(Err(RecvError::Lagged(n))) => {
-                // Broadcast lagged — we missed `n` events. Keep
-                // going; the launch generally produces enough events
-                // that we still find the last 0x2B by deadline.
-                lagged_count += n;
-                continue;
-            }
-            Ok(Err(RecvError::Closed)) => {
-                // Supervisor drain task exited. Surface the reason.
-                let reason = supervisor
-                    .last_error()
-                    .await
-                    .unwrap_or_else(|| "supervisor channel closed".into());
-                anyhow::bail!("kdebug stream went away mid-measurement: {reason}");
-            }
-            Err(_) => {
-                // recv timeout — either no event yet (still waiting)
-                // or we've seen some and now there's quiet => done.
-                if last_2b_mach.is_some() {
-                    tracing::info!(events_seen, "cold start: 400ms quiet after events, done");
-                    break;
-                }
-                // No events at all yet — fall through to deadline
-                // check at top of loop.
-            }
-        }
-    }
-    let last_ts = last_2b_mach.ok_or_else(|| {
-        anyhow!(
-            "no UIKit kdebug events (class 0x2B) seen after launch — \
-             ({events_seen} events received, {lagged_count} lagged). \
-             Supervisor may have just started; retry usually works."
-        )
-    })?;
+    };
+
     let delta = last_ts - mti.mach_absolute_time;
     let total_ns = mti.ticks_delta_to_ns(delta);
     let total_ms = total_ns / 1_000_000;
     tracing::info!(
-        events_seen,
-        lagged_count,
         delta_ticks = delta,
         total_ns,
         total_ms,
@@ -190,7 +156,7 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
 }
 
 /// Hot start: bring an existing process forward without re-init.
-/// RPC-only — kdebug first-frame proxy doesn't reliably fire on
+/// RPC-only — kdebug first-frame event doesn't reliably fire on
 /// foregrounding.
 pub async fn measure_hot_start(udid: &str, bundle_id: &str) -> Result<StartupTiming> {
     if let Err(e) = launch_app_with_options(udid, "com.apple.springboard", false).await {
@@ -204,7 +170,7 @@ pub async fn measure_hot_start(udid: &str, bundle_id: &str) -> Result<StartupTim
     let mut pc = ProcessControlClient::new(&mut remote_pc)
         .await
         .context("ProcessControlClient::new")?;
-    let t0 = Instant::now();
+    let t0 = std::time::Instant::now();
     let _pid = pc
         .launch_app(
             bundle_id.to_string(),
