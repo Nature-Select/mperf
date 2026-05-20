@@ -398,17 +398,16 @@ function SessionDetail({ session }: { session: SessionInfo }) {
         <span>{formatDuration(duration)}</span>
         <span>·</span>
         <span>{total?.length ?? 0} samples</span>
-        {snapshot !== null && (
-          <>
-            <span>·</span>
-            <ShowAllToggle
-              value={showAll}
-              hiddenCount={hiddenCount(snapshot)}
-              onChange={setShowAll}
-            />
-          </>
-        )}
       </div>
+      {snapshot !== null && hiddenCount(snapshot) > 0 && (
+        <FilterBanner
+          hiddenCount={hiddenCount(snapshot)}
+          shownCount={CHART_BACKED_METRICS.length - hiddenCount(snapshot)}
+          totalCount={CHART_BACKED_METRICS.length}
+          showAll={showAll}
+          onToggle={setShowAll}
+        />
+      )}
       {/*
         Chart order matches LiveView's picker-driven order
         (Frame → CPU Usage → CPU Core → Memory → GPU → Temperature) so
@@ -489,41 +488,66 @@ function hiddenCount(snapshot: string[]): number {
   return n
 }
 
-function ShowAllToggle({
-  value,
+/// Two-state info banner that lives between the session metadata row
+/// and the chart list. Surfaces the recording-time-snapshot filter
+/// state plus the escape hatch as a single obvious affordance — the
+/// previous compact toggle was buried inside the metadata strip and
+/// users couldn't find it.
+function FilterBanner({
   hiddenCount,
-  onChange,
+  shownCount,
+  totalCount,
+  showAll,
+  onToggle,
 }: {
-  value: boolean
   hiddenCount: number
-  onChange: (v: boolean) => void
+  shownCount: number
+  totalCount: number
+  showAll: boolean
+  onToggle: (v: boolean) => void
 }) {
-  // Hide the toggle entirely when nothing is gated — no point showing
-  // an escape hatch if the recording-time snapshot already covers
-  // every chart-backed metric.
-  if (hiddenCount === 0 && !value) return null
+  const filtered = !showAll
   return (
-    <label
+    <div
       style={{
-        display: 'inline-flex',
+        display: 'flex',
         alignItems: 'center',
-        gap: 6,
-        cursor: 'pointer',
-        userSelect: 'none',
-        color: 'var(--color-text-3)',
+        gap: 10,
+        padding: '8px 12px',
+        marginBottom: 12,
+        borderRadius: 6,
+        background: filtered ? 'rgba(74, 120, 255, 0.08)' : 'rgba(103, 194, 58, 0.08)',
+        border: `1px solid ${filtered ? 'rgba(74, 120, 255, 0.30)' : 'rgba(103, 194, 58, 0.30)'}`,
+        fontSize: 12,
+        color: 'var(--color-text-1)',
       }}
-      title="当时录制选择的指标 vs 这个 session 实际录到的所有指标"
     >
-      <input
-        type="checkbox"
-        checked={value}
-        onChange={(e) => onChange(e.target.checked)}
-        style={{ margin: 0 }}
-      />
-      <span>
-        全部展示
-        {!value && hiddenCount > 0 ? `（含 ${hiddenCount} 项当时未勾选）` : ''}
+      <span style={{ fontSize: 14, lineHeight: 1 }}>{filtered ? 'ℹ️' : '✓'}</span>
+      <span style={{ flex: 1 }}>
+        {filtered ? (
+          <>
+            录制时只勾选了 <b>{shownCount}</b> / {totalCount} 项指标，
+            <b>{hiddenCount}</b> 项已被隐藏。后端始终全采,数据仍在,可一键展开。
+          </>
+        ) : (
+          <>正在显示这个 session 录到的全部指标({totalCount} 项)。</>
+        )}
       </span>
-    </label>
+      <button
+        type="button"
+        onClick={() => onToggle(!showAll)}
+        style={{
+          padding: '4px 12px',
+          border: '1px solid var(--color-border-2)',
+          background: 'var(--color-bg-2)',
+          borderRadius: 4,
+          fontSize: 12,
+          cursor: 'pointer',
+          color: 'var(--color-text-1)',
+        }}
+      >
+        {filtered ? '全部展示' : '回到录制时选项'}
+      </button>
+    </div>
   )
 }
