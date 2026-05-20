@@ -74,11 +74,20 @@ pub async fn list_apps(
     }
 }
 
-/// Starts a recording. `selected_metrics` is the user's metrics-picker
-/// selection at the moment Start was clicked — persisted alongside the
-/// session so its History view filters charts to what the user was
-/// focused on at recording time. Empty/missing → stored as NULL and
-/// History falls back to "show every captured metric".
+/// Starts a recording.
+///
+/// `selected_metrics` is the user's metrics-picker selection at the
+/// moment Start was clicked — persisted alongside the session so its
+/// History view filters charts to what the user was focused on at
+/// recording time. Empty/missing → stored as NULL and History falls
+/// back to "show every captured metric".
+///
+/// `sampling_intervals` is the per-chart-card sampling cadence (ms)
+/// the user configured. Backend translates each card's interval to its
+/// owning sampler — when multiple cards share a sampler (iOS
+/// sysmontap, Android CpuSampler emits Total + Core together), the
+/// sampler runs at the fastest requested rate. Empty/missing → each
+/// sampler uses its hardcoded default.
 #[tauri::command]
 pub async fn start_session(
     state: State<'_, AppState>,
@@ -88,6 +97,7 @@ pub async fn start_session(
     device_model: Option<String>,
     target_pkg: String,
     selected_metrics: Option<Vec<String>>,
+    sampling_intervals: Option<std::collections::HashMap<String, u64>>,
 ) -> Result<i64, String> {
     // PerfDog-style: app selection is mandatory. Frontend disables Start
     // until both device + app are picked; this is the backend guard.
@@ -96,6 +106,7 @@ pub async fn start_session(
         return Err("a target app must be selected before recording".into());
     }
     let selected_metrics = selected_metrics.filter(|v| !v.is_empty());
+    let sampling_intervals = sampling_intervals.filter(|m| !m.is_empty());
     session::start_recording(
         &state,
         &app,
@@ -104,6 +115,7 @@ pub async fn start_session(
         device_model,
         target_pkg,
         selected_metrics,
+        sampling_intervals,
     )
     .await
 }

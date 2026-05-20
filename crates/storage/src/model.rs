@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Information needed at session creation time. Wall-clock start is required
 /// so we can later display "this session was recorded at 14:23:45".
@@ -17,6 +18,12 @@ pub struct SessionMeta {
     /// `None` = "show every metric this session captured" (legacy
     /// sessions and any future caller that doesn't pass a snapshot).
     pub selected_metrics: Option<Vec<String>>,
+    /// Snapshot of the per-metric sampling intervals (ms) at recording
+    /// start. Map key is a chart-card id (e.g. `"frame"`, `"cpu_usage"`);
+    /// the value is the interval the corresponding sampler ran at.
+    /// `None` = legacy session recorded before frequency was
+    /// configurable; samplers used their hardcoded defaults.
+    pub sampling_intervals: Option<HashMap<String, u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +36,7 @@ pub struct SessionInfo {
     pub device_model: Option<String>,
     pub app_bundle_id: Option<String>,
     pub selected_metrics: Option<Vec<String>>,
+    pub sampling_intervals: Option<HashMap<String, u64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
