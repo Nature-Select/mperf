@@ -66,17 +66,34 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
     // conflict). ~1-2s setup, not counted in the measurement.
     let mut remote = build_dtx_remote(udid).await?;
 
-    // proc_attrs is required by sysmontap's set_config even though we
-    // don't decode any per-process values — we only key on PID, which
-    // is the processes Dict key itself.
-    let proc_attrs = {
+    // Need BOTH proc_attrs and sys_attrs for set_config — sysmontap
+    // rejects empty system_attributes on some iOS versions (saw it
+    // silently no-op'ing sample emission in local repros). Mirrors
+    // cpu.rs's setup.
+    let (proc_attrs, sys_attrs) = {
         let mut info = DeviceInfoClient::new(&mut remote)
             .await
             .context("DeviceInfoClient::new")?;
-        info.sysmon_process_attributes()
+        let p = info
+            .sysmon_process_attributes()
             .await
-            .context("sysmon_process_attributes")?
+            .context("sysmon_process_attributes")?;
+        let s = info
+            .sysmon_system_attributes()
+            .await
+            .context("sysmon_system_attributes")?;
+        (p, s)
     };
+
+    // Find the index of the "pid" attribute. Processes Dict values
+    // are positional arrays keyed by proc_attrs order (CLAUDE.md
+    // calls this out — keys are NOT necessarily PID strings, varies
+    // by iOS version). We match the launched PID by extracting the
+    // pid attribute from each value array.
+    let pid_idx = proc_attrs
+        .iter()
+        .position(|a| a == "pid")
+        .ok_or_else(|| anyhow!("sysmontap proc_attrs missing 'pid'; got {proc_attrs:?}"))?;
 
     let mut sysmontap = SysmontapRaw::new(&mut remote)
         .await
@@ -84,8 +101,8 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
     sysmontap
         .set_config(&SysmontapConfig {
             interval_ms: 300,
-            process_attributes: proc_attrs,
-            system_attributes: vec![],
+            process_attributes: proc_attrs.clone(),
+            system_attributes: sys_attrs,
         })
         .await
         .context("sysmontap set_config")?;
@@ -107,7 +124,6 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
     // launch RPC". Total = RPC time + time until sysmontap sees the
     // new PID active = "RPC start → first activity" measurement,
     // excluding both DTX setups.
-    let pid_key = pid.to_string();
     let wait_start = Instant::now();
     let deadline = wait_start + Duration::from_secs(8);
     loop {
@@ -122,10 +138,8 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
             .await
             .map_err(|_| anyhow!("sysmontap next_sample timed out"))?
             .map_err(|e| anyhow!("sysmontap next_sample error: {e}"))?;
-        if let Some(processes) = sample.processes {
-            if processes.contains_key(&pid_key) {
-                break;
-            }
+        if sample_has_pid(&sample, pid, pid_idx) {
+            break;
         }
     }
     let wait_elapsed = wait_start.elapsed();
@@ -156,6 +170,38 @@ pub async fn measure_hot_start(udid: &str, bundle_id: &str) -> Result<StartupTim
     Ok(StartupTiming {
         total_ms: rpc_elapsed.as_millis() as u64,
     })
+}
+
+/// Scan a sysmontap sample's processes Dict for `target_pid`.
+///
+/// Robust against the Dict-key format varying across iOS versions
+/// (sometimes the key IS the PID stringified, sometimes it's a
+/// process-name or other handle — CLAUDE.md flags this as a known
+/// per-version quirk). We instead iterate the value arrays, which
+/// are positional per `proc_attrs`, and decode the pid attribute at
+/// the resolved index. Matches by integer equality so any sample
+/// where sysmontap has registered the new process counts.
+fn sample_has_pid(
+    sample: &crate::sysmontap_raw::SysmontapSample,
+    target_pid: u64,
+    pid_idx: usize,
+) -> bool {
+    let Some(processes) = sample.processes.as_ref() else {
+        return false;
+    };
+    for value in processes.values() {
+        let Some(arr) = value.as_array() else { continue };
+        let Some(pid_val) = arr.get(pid_idx) else { continue };
+        let pid_num = match pid_val {
+            plist::Value::Integer(i) => i.as_unsigned(),
+            plist::Value::String(s) => s.parse::<u64>().ok(),
+            _ => None,
+        };
+        if pid_num == Some(target_pid) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build a fresh DTX RemoteServerClient — same boilerplate as
