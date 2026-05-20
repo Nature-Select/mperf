@@ -328,7 +328,25 @@ impl CoreProfileSessionRaw {
                 continue;
             }
             if bytes.starts_with(b"bplist") {
-                tracing::info!(bytes_len = bytes.len(), "next_events: bplist payload (skip)");
+                // Decode so we can see what the device is telling
+                // us — coreprofile sends notices/errors as bplist
+                // dicts with 'notice', 'status', 'error' keys.
+                match ns_keyed_archive::decode::from_bytes(&bytes) {
+                    Ok(v) => {
+                        tracing::info!(
+                            bytes_len = bytes.len(),
+                            decoded = ?v,
+                            "next_events: bplist payload (skip)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::info!(
+                            bytes_len = bytes.len(),
+                            decode_err = %e,
+                            "next_events: bplist payload (skip, decode failed)"
+                        );
+                    }
+                }
                 continue;
             }
             let events = parse_kd_buf_records(&bytes);
