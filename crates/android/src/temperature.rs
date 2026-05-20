@@ -22,7 +22,8 @@ use smallvec::smallvec;
 use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 
-const PERIOD_MS: u64 = 2000;
+const MIN_INTERVAL_MS: u64 = 500;
+pub const DEFAULT_INTERVAL_MS: u64 = 2000;
 
 /// One adb shell roundtrip dumps every zone's `type` and `temp`. Cheaper
 /// than per-zone calls and avoids the ~30ms shell-spawn overhead each.
@@ -35,11 +36,15 @@ const CPU_KEYWORDS: &[&str] =
 
 pub struct TempSampler {
     serial: String,
+    interval_ms: u64,
 }
 
 impl TempSampler {
-    pub fn new(serial: impl Into<String>) -> Self {
-        Self { serial: serial.into() }
+    pub fn new(serial: impl Into<String>, interval_ms: u64) -> Self {
+        Self {
+            serial: serial.into(),
+            interval_ms: interval_ms.max(MIN_INTERVAL_MS),
+        }
     }
 }
 
@@ -50,7 +55,7 @@ impl Sampler for TempSampler {
     }
 
     fn target_hz(&self) -> f32 {
-        0.5
+        1000.0 / self.interval_ms as f32
     }
 
     async fn start(
@@ -58,9 +63,10 @@ impl Sampler for TempSampler {
         ctx: SamplerCtx,
     ) -> Result<BoxStream<'static, Result<Sample, SamplerError>>, SamplerError> {
         let serial = self.serial.clone();
+        let interval_ms = self.interval_ms;
         let clock = ctx.clock.clone();
         let s = stream! {
-            let mut ticker = interval(Duration::from_millis(PERIOD_MS));
+            let mut ticker = interval(Duration::from_millis(interval_ms));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             ticker.tick().await; // skip immediate
             // OEMs that restrict /sys/class/thermal for shell users will

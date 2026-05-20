@@ -44,7 +44,8 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tokio::time::{interval, MissedTickBehavior};
 
-const PERIOD_MS: u64 = 1000;
+const MIN_INTERVAL_MS: u64 = 200;
+pub const DEFAULT_INTERVAL_MS: u64 = 1000;
 const MOVIE_FRAME_MS: f64 = 1000.0 / 24.0; // ~41.66ms
 
 /// Per-layer state tracked across sampling ticks: last frame seen + the
@@ -147,13 +148,19 @@ struct SvTickResult {
 pub struct FpsSampler {
     serial: String,
     target_pkg: String,
+    interval_ms: u64,
 }
 
 impl FpsSampler {
-    pub fn new(serial: impl Into<String>, target_pkg: impl Into<String>) -> Self {
+    pub fn new(
+        serial: impl Into<String>,
+        target_pkg: impl Into<String>,
+        interval_ms: u64,
+    ) -> Self {
         Self {
             serial: serial.into(),
             target_pkg: target_pkg.into(),
+            interval_ms: interval_ms.max(MIN_INTERVAL_MS),
         }
     }
 }
@@ -165,7 +172,7 @@ impl Sampler for FpsSampler {
     }
 
     fn target_hz(&self) -> f32 {
-        1.0
+        1000.0 / self.interval_ms as f32
     }
 
     async fn start(
@@ -174,6 +181,7 @@ impl Sampler for FpsSampler {
     ) -> Result<BoxStream<'static, Result<Sample, SamplerError>>, SamplerError> {
         let serial = self.serial.clone();
         let pkg = self.target_pkg.clone();
+        let interval_ms = self.interval_ms;
         if !adb::is_safe_pkg_name(&pkg) {
             return Err(SamplerError::Fatal(anyhow::anyhow!(
                 "refusing unsafe package name: {pkg}"
@@ -181,7 +189,7 @@ impl Sampler for FpsSampler {
         }
         let clock = ctx.clock.clone();
         let s = stream! {
-            let mut ticker = interval(Duration::from_millis(PERIOD_MS));
+            let mut ticker = interval(Duration::from_millis(interval_ms));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             ticker.tick().await; // skip immediate
             let mut last: Option<(GfxStats, Instant)> = None;

@@ -19,18 +19,30 @@ use smallvec::smallvec;
 use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 
-const PERIOD_MS: u64 = 1000;
+/// Hard-floor on sampler cadence — anything faster than this puts more
+/// load on adb than the resulting data is worth. The configurable
+/// `interval_ms` is clamped to this minimum on construction.
+const MIN_INTERVAL_MS: u64 = 200;
+/// Default cadence when the caller doesn't override. Matches the
+/// pre-configurable behaviour so unchanged call sites are unaffected.
+pub const DEFAULT_INTERVAL_MS: u64 = 1000;
 
 pub struct CpuSampler {
     serial: String,
     target_pkg: String,
+    interval_ms: u64,
 }
 
 impl CpuSampler {
-    pub fn new(serial: impl Into<String>, target_pkg: impl Into<String>) -> Self {
+    pub fn new(
+        serial: impl Into<String>,
+        target_pkg: impl Into<String>,
+        interval_ms: u64,
+    ) -> Self {
         Self {
             serial: serial.into(),
             target_pkg: target_pkg.into(),
+            interval_ms: interval_ms.max(MIN_INTERVAL_MS),
         }
     }
 }
@@ -42,7 +54,7 @@ impl Sampler for CpuSampler {
     }
 
     fn target_hz(&self) -> f32 {
-        1.0
+        1000.0 / self.interval_ms as f32
     }
 
     async fn start(
@@ -51,6 +63,7 @@ impl Sampler for CpuSampler {
     ) -> Result<BoxStream<'static, Result<Sample, SamplerError>>, SamplerError> {
         let serial = self.serial.clone();
         let pkg = self.target_pkg.clone();
+        let interval_ms = self.interval_ms;
         // Initial reading; if this fails we surface immediately rather than
         // returning a stream that yields an error on first poll.
         let initial = read_proc_stat(&serial).await?;
@@ -65,9 +78,9 @@ impl Sampler for CpuSampler {
         let s = stream! {
             let mut last = initial;
             let mut last_app_jiffies: Option<u64> = None;
-            let mut ticker = interval(Duration::from_millis(PERIOD_MS));
+            let mut ticker = interval(Duration::from_millis(interval_ms));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            // First tick fires immediately; skip it so we sample one PERIOD_MS later.
+            // First tick fires immediately; skip it so we sample one interval later.
             ticker.tick().await;
 
             loop {

@@ -34,15 +34,23 @@ use idevice::{
 use mperf_schema::{MetricKind, Sample, Sampler, SamplerCtx, SamplerError};
 use smallvec::smallvec;
 
-const SAMPLE_INTERVAL_SEC: f64 = 1.0;
+const MIN_INTERVAL_MS: u32 = 200;
+pub const DEFAULT_INTERVAL_MS: u32 = 1000;
 
 pub struct GraphicsSampler {
     udid: String,
+    /// graphics.opengl channel cadence (ms). DTX accepts the value as
+    /// a seconds-fractional float; we store ms for uniformity with the
+    /// per-metric IPC payload and convert at the channel-start call.
+    interval_ms: u32,
 }
 
 impl GraphicsSampler {
-    pub fn new(udid: impl Into<String>) -> Self {
-        Self { udid: udid.into() }
+    pub fn new(udid: impl Into<String>, interval_ms: u32) -> Self {
+        Self {
+            udid: udid.into(),
+            interval_ms: interval_ms.max(MIN_INTERVAL_MS),
+        }
     }
 }
 
@@ -53,7 +61,7 @@ impl Sampler for GraphicsSampler {
     }
 
     fn target_hz(&self) -> f32 {
-        1.0
+        1000.0 / self.interval_ms as f32
     }
 
     async fn start(
@@ -64,6 +72,7 @@ impl Sampler for GraphicsSampler {
         let _provider = connect::provider_for(&self.udid).await.map_err(map_setup)?;
 
         let udid = self.udid.clone();
+        let interval_sec = self.interval_ms as f64 / 1000.0;
         let clock = ctx.clock.clone();
 
         let s = stream! {
@@ -121,13 +130,13 @@ impl Sampler for GraphicsSampler {
                 Ok(c) => c,
                 Err(e) => { yield Err(map_ide("GraphicsRaw::new", e)); return; }
             };
-            if let Err(e) = gfx.start_sampling(SAMPLE_INTERVAL_SEC).await {
+            if let Err(e) = gfx.start_sampling(interval_sec).await {
                 yield Err(map_ide("start_sampling", e));
                 return;
             }
             tracing::info!(
                 sampler = "ios.graphics",
-                interval_sec = SAMPLE_INTERVAL_SEC,
+                interval_sec,
                 "graphics sampling started"
             );
 
