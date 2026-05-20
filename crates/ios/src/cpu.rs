@@ -26,7 +26,6 @@ use mperf_schema::{LabelKey, MetricKind, Sample, Sampler, SamplerCtx, SamplerErr
 use smallvec::smallvec;
 
 const MIN_INTERVAL_MS: u32 = 200;
-pub const DEFAULT_INTERVAL_MS: u32 = 1000;
 
 pub struct CpuSampler {
     udid: String,

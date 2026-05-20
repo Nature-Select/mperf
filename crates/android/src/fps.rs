@@ -45,7 +45,6 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, MissedTickBehavior};
 
 const MIN_INTERVAL_MS: u64 = 200;
-pub const DEFAULT_INTERVAL_MS: u64 = 1000;
 const MOVIE_FRAME_MS: f64 = 1000.0 / 24.0; // ~41.66ms
 
 /// Per-layer state tracked across sampling ticks: last frame seen + the

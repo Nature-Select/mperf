@@ -23,7 +23,6 @@ use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 
 const MIN_INTERVAL_MS: u64 = 500;
-pub const DEFAULT_INTERVAL_MS: u64 = 2000;
 
 /// One adb shell roundtrip dumps every zone's `type` and `temp`. Cheaper
 /// than per-zone calls and avoids the ~30ms shell-spawn overhead each.

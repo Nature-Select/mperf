@@ -35,7 +35,6 @@ use mperf_schema::{MetricKind, Sample, Sampler, SamplerCtx, SamplerError};
 use smallvec::smallvec;
 
 const MIN_INTERVAL_MS: u32 = 200;
-pub const DEFAULT_INTERVAL_MS: u32 = 1000;
 
 pub struct GraphicsSampler {
     udid: String,
