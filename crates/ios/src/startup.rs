@@ -65,7 +65,12 @@ pub async fn measure_cold_start(udid: &str, bundle_id: &str) -> Result<StartupTi
             }
             Err(e) => {
                 if attempt < MAX_ATTEMPTS {
-                    let backoff = Duration::from_millis(2000 * attempt as u64);
+                    // 500ms / 1000ms backoff — most failures are
+                    // either stale-stream EOF (needs no wait, just
+                    // a fresh transport) or kperf-release-in-progress
+                    // (sub-second on iOS 26.4.2 in practice). Old
+                    // 2s/4s was overkill.
+                    let backoff = Duration::from_millis(500 * attempt as u64);
                     tracing::warn!(
                         attempt,
                         backoff_ms = backoff.as_millis() as u64,

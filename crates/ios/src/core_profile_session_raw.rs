@@ -34,7 +34,6 @@ use idevice::{
     IdeviceService, ReadWrite,
 };
 use plist::{Dictionary, Value};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -774,64 +773,35 @@ fn collect_strings(v: &Value, out: &mut Vec<String>) {
 }
 
 // ---------------------------------------------------------------
-// Per-UDID session pool
+// Per-call session
 // ---------------------------------------------------------------
 //
-// iOS 26 doesn't seem to release kperf between consecutive
-// `setConfig` / `start` calls from new connections — the second
-// attempt's setConfig is silently swallowed and no kdebug data
-// streams. PerfDog presumably keeps a single long-lived
-// coreprofile session open and just demarcates measurements by
-// timestamps; we do the same.
+// We previously cached the coreprofile session per UDID (idea:
+// PerfDog presumably keeps it open across measurements). That
+// caused a different bug: between calls iOS would silently close
+// the TCP stream, and the next measurement hit
+// "dtx payload header truncated: 0 bytes" on the first read. The
+// cure (invalidate + recreate) added ~7s to the second measurement.
 //
-// First measure_cold_start creates the session per device and
-// registers it here. Subsequent measurements re-acquire the same
-// session, re-fetch machTimeInfo for a fresh t0, fire the launch
-// RPC, and wait for the first 0x2B event past t0. The kdebug
-// stream keeps flowing continuously — we never call `stop`.
-//
-// Cleanup: sessions live until the process exits. A stale session
-// (transport died) will surface as a read error on the next
-// measurement; the entry is removed and recreated.
+// New design: create a fresh session per call. The retry wrapper
+// in startup.rs handles kperf-release races. The `Arc<Mutex>` shape
+// is preserved for API stability with the caller, even though we
+// no longer reuse instances.
 
 type SharedSession = Arc<Mutex<CoreProfileSessionRaw>>;
-static SESSIONS: std::sync::OnceLock<Mutex<HashMap<String, SharedSession>>> =
-    std::sync::OnceLock::new();
 
-fn sessions() -> &'static Mutex<HashMap<String, SharedSession>> {
-    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Get-or-create the coreprofile session for `udid`. If a previously-
-/// cached session's transport has died, drop it and create a fresh
-/// one.
+/// Open a fresh coreprofile session for `udid`. No caching — every
+/// measurement gets its own transport.
 pub async fn acquire_session(udid: &str) -> Result<SharedSession> {
-    {
-        let map = sessions().lock().await;
-        if let Some(s) = map.get(udid) {
-            return Ok(s.clone());
-        }
-    }
-    // Create outside the map lock so we don't block other devices
-    // while doing the ~150ms transport open.
     let session = CoreProfileSessionRaw::start(udid)
         .await
         .context("CoreProfileSessionRaw::start")?;
-    let shared: SharedSession = Arc::new(Mutex::new(session));
-    let mut map = sessions().lock().await;
-    // Race: another caller may have inserted while we were creating.
-    // Theirs wins — our session drops, theirs stays.
-    let entry = map.entry(udid.to_string()).or_insert_with(|| shared.clone());
-    Ok(entry.clone())
+    Ok(Arc::new(Mutex::new(session)))
 }
 
-/// Forget the cached session for `udid` — caller signals it's broken
-/// (e.g. read error, kperf-wedge notice). The next acquire creates a
-/// fresh one. The Arc keeps any in-flight users alive until they
-/// drop.
-pub async fn invalidate_session(udid: &str) {
-    let mut map = sessions().lock().await;
-    map.remove(udid);
+/// No-op kept for API compatibility — there's no cache to invalidate
+/// anymore. Callers can keep calling it on error paths; we ignore.
+pub async fn invalidate_session(_udid: &str) {
 }
 
 /// Generate an upper-case UUID-4 string — used as the `uuid` field
