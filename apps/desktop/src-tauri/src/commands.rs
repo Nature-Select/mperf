@@ -71,6 +71,40 @@ pub struct StartupMeasurement {
 /// session's `startup_timings` JSON column. Cross-app measurement
 /// during a different recording is allowed but not persisted — that
 /// would taint the active session's "what was measured" record.
+/// Cheap probe: would the next `start_session` walk the cold or hot
+/// branch? Same logic as `session::measure_startup_for_start_session`
+/// — Android `pidof` / iOS `resolve_bundle_to_pids`. Returns "cold"
+/// when the probe says the app isn't running OR when the probe
+/// errors (matches the conservative fallback inside start_session,
+/// which assumes cold on probe failure).
+///
+/// Frontend uses this DURING the iOS kperf cooldown window to decide
+/// whether to show the "still cooling down" Modal: only relevant
+/// when the imminent record will actually open a coreprofile
+/// session, i.e. cold. Hot launches don't acquire kperf.
+#[tauri::command]
+pub async fn detect_startup_mode(
+    device_id: String,
+    platform: Platform,
+    target_pkg: String,
+) -> Result<String, String> {
+    let target_pkg = target_pkg.trim().to_string();
+    if target_pkg.is_empty() {
+        return Err("a target app must be selected".into());
+    }
+    let is_running = match platform {
+        Platform::Android => matches!(
+            mperf_android::pidof(&device_id, &target_pkg).await,
+            Ok(Some(_))
+        ),
+        Platform::Ios => match mperf_ios::resolve_bundle_to_pids(&device_id, &target_pkg).await {
+            Ok(r) => !r.pids.is_empty(),
+            Err(_) => false,
+        },
+    };
+    Ok(if is_running { "hot" } else { "cold" }.to_string())
+}
+
 #[tauri::command]
 pub async fn measure_startup(
     state: State<'_, AppState>,

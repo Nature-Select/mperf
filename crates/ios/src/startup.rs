@@ -215,20 +215,27 @@ async fn fetch_mach_time_info(
             _ => None,
         })
         .ok_or_else(|| anyhow!("machTimeInfo[0] not unsigned: {arr:?}"))?;
-    let numer = arr
+    let numer_u64 = arr
         .get(1)
         .and_then(|v| match v {
             Value::Integer(i) => i.as_unsigned(),
             _ => None,
         })
-        .ok_or_else(|| anyhow!("machTimeInfo[1] not unsigned: {arr:?}"))? as u32;
-    let denom = arr
+        .ok_or_else(|| anyhow!("machTimeInfo[1] not unsigned: {arr:?}"))?;
+    let denom_u64 = arr
         .get(2)
         .and_then(|v| match v {
             Value::Integer(i) => i.as_unsigned(),
             _ => None,
         })
-        .ok_or_else(|| anyhow!("machTimeInfo[2] not unsigned: {arr:?}"))? as u32;
+        .ok_or_else(|| anyhow!("machTimeInfo[2] not unsigned: {arr:?}"))?;
+    // mach_timebase_info on ARM64 reports tiny ratios (125/3 on iPhone),
+    // but `as u32` would silently truncate any future device whose
+    // numer/denom overflows u32. Loud error is the right behaviour.
+    let numer = u32::try_from(numer_u64)
+        .map_err(|_| anyhow!("machTimeInfo[1] {numer_u64} does not fit in u32"))?;
+    let denom = u32::try_from(denom_u64)
+        .map_err(|_| anyhow!("machTimeInfo[2] {denom_u64} does not fit in u32"))?;
     Ok(MachTimeInfo {
         mach_absolute_time,
         numer,

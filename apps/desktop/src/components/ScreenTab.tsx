@@ -15,6 +15,11 @@ interface Props {
   /// the app already running"). Mirrors into the row so the user can
   /// see the value without doing anything extra.
   autoStartup: { mode: StartupMode; total_ms: number } | null
+  /// Seconds remaining on the iOS kperf cooldown after a cold-startup
+  /// measurement. 0 when not in cooldown. Shown next to the value as
+  /// "下次冷启动测量可用 · 还需 XXs" so the user can plan re-records
+  /// without guessing at the 30s wait.
+  cooldownRemainingSec: number
 }
 
 /// Top strip above the chart list — mirrors PerfDog's "SceneTab".
@@ -25,12 +30,14 @@ interface Props {
 ///    Measurement fires automatically at session start: backend
 ///    detects whether the target app is already running (→ hot) or
 ///    needs a launch (→ cold) and measures once. No manual button —
-///    iOS 26 only supports one kperf consumer per mperf process
-///    lifetime, so multi-shot measurement on demand isn't feasible.
+///    iOS only supports one kperf consumer at a time and releases
+///    the lock asynchronously after the previous session exits, so
+///    multi-shot measurement on demand isn't feasible.
 export function ScreenTab({
   screenshotOn,
   startupTimingOn,
   autoStartup,
+  cooldownRemainingSec,
 }: Props) {
   if (!screenshotOn && !startupTimingOn) return null
   return (
@@ -42,15 +49,22 @@ export function ScreenTab({
           </div>
         </div>
       )}
-      {startupTimingOn && <StartupReadout autoStartup={autoStartup} />}
+      {startupTimingOn && (
+        <StartupReadout
+          autoStartup={autoStartup}
+          cooldownRemainingSec={cooldownRemainingSec}
+        />
+      )}
     </div>
   )
 }
 
 function StartupReadout({
   autoStartup,
+  cooldownRemainingSec,
 }: {
   autoStartup: { mode: StartupMode; total_ms: number } | null
+  cooldownRemainingSec: number
 }) {
   // Pure display — render straight from the prop. Previous version
   // mirrored into local state, which got stuck on the first-recording
@@ -69,7 +83,8 @@ function StartupReadout({
     '若 app 未在跑(后台或被杀)记为冷启动,在跑(前台或后台)记为热启动。' +
     'Android 通过 am start -W TotalTime(kernel 测量到首帧);' +
     'iOS 冷启动通过 coreprofilesessiontap 的 kdebug 事件流估算首帧,热启动取 processcontrol launchApp RPC 时长。' +
-    'iOS 26 内核 kperf 锁释放需 ~30s,两次冷启动测量请间隔 30s 以上,否则会失败。'
+    'iOS 内核 kperf 锁释放是异步的,两次冷启动测量请间隔 30s 以上,否则会失败。' +
+    '冷却中再次开始录制会弹出确认窗口,可选择继续等待或跳过启动时间测量。'
 
   return (
     <div className={styles.startupSection}>
@@ -77,6 +92,11 @@ function StartupReadout({
         <span className={styles.startupLabel}>启动时间:</span>
         <span className={styles.startupValue}>{valueText}</span>
         <span className={styles.startupType}>· {typeText}</span>
+        {cooldownRemainingSec > 0 && (
+          <span className={styles.startupCooldown}>
+            · 冷启动冷却中,还需 {cooldownRemainingSec}s
+          </span>
+        )}
         <Tooltip content={hint} position="bottom">
           <Info size={11} className={styles.startupHint} />
         </Tooltip>

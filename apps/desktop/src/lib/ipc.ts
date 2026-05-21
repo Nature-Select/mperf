@@ -224,6 +224,24 @@ export function measureStartup(
   })
 }
 
+/// Cheap probe — would the next start_session walk cold or hot? Used
+/// to suppress the iOS-kperf cooldown Modal when the imminent launch
+/// is actually hot (which doesn't open a coreprofile session and so
+/// doesn't compete for the kperf lock). Android: `pidof`. iOS:
+/// `resolve_bundle_to_pids` (DTX, ~1-2s — slow, so caller should
+/// only ask when it matters, e.g. inside the cooldown window).
+export function detectStartupMode(
+  deviceId: string,
+  platform: Platform,
+  targetPkg: string,
+): Promise<StartupMode> {
+  return invoke<StartupMode>('detect_startup_mode', {
+    deviceId,
+    platform,
+    targetPkg,
+  })
+}
+
 export interface SamplePoint {
   ts_us: number
   value: number

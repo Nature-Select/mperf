@@ -148,10 +148,23 @@ impl Storage {
                     _ => unreachable!("mode validated above"),
                 }
                 let json = serde_json::to_string(&current).expect("StartupTimings serialises");
-                tx.execute(
+                let affected = tx.execute(
                     "UPDATE sessions SET startup_timings = ? WHERE id = ?",
                     params![json, session_id],
                 )?;
+                // Guard against silently succeeding when the session
+                // row no longer exists (e.g. caller raced a delete).
+                // Without this, RMW reads default-empty timings, UPDATE
+                // matches 0 rows, commit returns Ok — and the caller
+                // believes the measurement was persisted.
+                if affected == 0 {
+                    return Err(tokio_rusqlite::Error::Other(
+                        format!(
+                            "record_startup_timing: session {session_id} not found"
+                        )
+                        .into(),
+                    ));
+                }
                 tx.commit()?;
                 Ok(())
             })

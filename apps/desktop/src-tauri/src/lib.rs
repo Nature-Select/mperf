@@ -92,6 +92,7 @@ pub fn run() {
             commands::get_device_info,
             commands::start_session,
             commands::measure_startup,
+            commands::detect_startup_mode,
             commands::stop_session,
             commands::list_sessions,
             commands::get_session_samples,

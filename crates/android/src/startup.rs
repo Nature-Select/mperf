@@ -43,9 +43,13 @@ pub async fn measure_cold_start(serial: &str, pkg: &str) -> Result<StartupTiming
     // Stop the app explicitly before measurement. Ignore failures
     // (already-stopped → exit non-zero on some toyboxes).
     let _ = adb::shell_raw(serial, &format!("am force-stop {pkg}")).await;
+    // Single-quote {component}: activity names for Kotlin inner /
+    // companion classes legitimately contain `$` (e.g. `pkg/.Foo$Bar`),
+    // and `adb shell` hands the command to /system/bin/sh which would
+    // otherwise treat `$Bar` as an empty variable.
     let cmd = format!(
         "am start -W -S -a android.intent.action.MAIN \
-         -c android.intent.category.LAUNCHER -n {component}"
+         -c android.intent.category.LAUNCHER -n '{component}'"
     );
     run_am_start(serial, &cmd).await
 }
@@ -62,9 +66,11 @@ pub async fn measure_hot_start(serial: &str, pkg: &str) -> Result<StartupTiming>
         anyhow::bail!("unsafe package name: {pkg}");
     }
     let component = resolve_launcher_component(serial, pkg).await?;
+    // Same quoting note as `measure_cold_start` above — protects
+    // `$`-bearing inner-class activity names from sh expansion.
     let cmd = format!(
         "am start -W -a android.intent.action.MAIN \
-         -c android.intent.category.LAUNCHER -n {component}"
+         -c android.intent.category.LAUNCHER -n '{component}'"
     );
     let raw = run_am_start_raw(serial, &cmd).await?;
     if is_already_foreground(&raw) {

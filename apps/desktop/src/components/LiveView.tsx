@@ -5,6 +5,7 @@ import {
   Button,
   Checkbox,
   Layout,
+  Modal,
   Space,
   Tooltip,
   Typography,
@@ -14,6 +15,7 @@ import { Bookmark, Play, Square } from 'lucide-react'
 import {
   addMarker,
   deleteMarker,
+  detectStartupMode,
   Device,
   EVENT_SAMPLE,
   EVENT_SESSION_ENDED,
@@ -41,6 +43,7 @@ import { SidebarTabs } from '@/components/SidebarTabs'
 import { useResizableSidebar } from '@/lib/useResizableSidebar'
 import { useMetricsSelection } from '@/lib/useMetricsSelection'
 import { snapshotEffectiveFrequencies, useMetricFrequencies } from '@/lib/useMetricFrequencies'
+import { useStartupCooldown } from '@/lib/useStartupCooldown'
 import chartStyles from '@/components/chart-shared.module.scss'
 
 const { Sider, Content } = Layout
@@ -71,6 +74,17 @@ export function LiveView({
   // without the user clicking "测试" first.
   const [autoStartup, setAutoStartup] =
     useState<{ mode: 'cold' | 'hot'; total_ms: number } | null>(null)
+  // Pending start request — when the user clicks Start during the iOS
+  // kperf cooldown window AND the next launch is going to be cold
+  // (probed via detect_startup_mode), we open a confirm Modal
+  // instead of firing start_session immediately. Hot launches don't
+  // open a coreprofile session and so don't compete for kperf —
+  // those skip the Modal entirely.
+  const [pendingStart, setPendingStart] = useState<{ remainingSec: number } | null>(null)
+  // True while we're awaiting `detect_startup_mode` (DTX probe ~1-2s
+  // on iOS). Disables the Start button and shows a "检测中..." label
+  // so the user knows the click was received and we're working.
+  const [probingStartupMode, setProbingStartupMode] = useState(false)
   const { data, isLoading } = useQuery({
     queryKey: ['devices'],
     queryFn: listDevices,
@@ -90,6 +104,13 @@ export function LiveView({
   )
   const recording = activeSessionId != null
   const [targetPkg, setTargetPkg] = useState<string | null>(null)
+  // iOS kperf cooldown (per-device). 0 outside the 35s window after a
+  // successful cold-startup measurement; ticks down once per second
+  // while inside it. We only enforce / display this for iOS — Android
+  // measures via `am start -W` which doesn't have a kernel lock.
+  const cooldown = useStartupCooldown(
+    selected && selected.platform === 'ios' ? selected.id : null,
+  )
   const sidebar = useResizableSidebar()
   /// Log terminal toggle + resizable height. Default closed (240px
   /// reserved height makes the chart area feel cramped on first
@@ -164,6 +185,51 @@ export function LiveView({
 
   const handleStart = async () => {
     if (!selected || !targetPkg) return
+    // iOS kperf cooldown gating — only the cold-launch path opens a
+    // coreprofile session, so we only need to warn when the imminent
+    // launch is actually going to be cold. Hot launches reuse the
+    // running process and don't touch kperf. We probe via the same
+    // logic backend uses to pick the mode (resolve_bundle_to_pids on
+    // iOS), but only inside the cooldown window — outside it the
+    // probe adds 1-2s for nothing.
+    const wantsStartupTiming = metricsSelection.has('startup_timing')
+    if (
+      wantsStartupTiming
+      && selected.platform === 'ios'
+      && cooldown.inCooldown
+    ) {
+      setProbingStartupMode(true)
+      let nextMode: 'cold' | 'hot'
+      try {
+        nextMode = await detectStartupMode(
+          selected.id,
+          selected.platform,
+          targetPkg,
+        )
+      } catch (e) {
+        // Probe failed — fall back to assuming cold (same default
+        // backend uses on probe failure). Better to show the Modal
+        // unnecessarily than to silently fail the measurement.
+        console.warn('[mperf] detect_startup_mode failed, assuming cold:', e)
+        nextMode = 'cold'
+      } finally {
+        setProbingStartupMode(false)
+      }
+      if (nextMode === 'cold') {
+        setPendingStart({ remainingSec: cooldown.remainingSec })
+        return
+      }
+      // Hot path during cooldown — safe to proceed, no kperf contention.
+    }
+    await actuallyStartSession({ skipStartupTiming: false })
+  }
+
+  /// Final stage of Start — splits out so the cooldown-confirm Modal
+  /// can call it directly. `skipStartupTiming=true` strips the metric
+  /// from the snapshot sent to backend so no kperf-locked measurement
+  /// runs (other metrics still record normally).
+  const actuallyStartSession = async (opts: { skipStartupTiming: boolean }) => {
+    if (!selected || !targetPkg) return
     setNotice(null)
     setMarkers([])
     // Clear the previous recording's startup readout so the row
@@ -171,6 +237,9 @@ export function LiveView({
     // Without this, the user would briefly see the previous value
     // (e.g. a hot 80ms) while the cold measurement is in flight.
     setAutoStartup(null)
+    const metricsForSession = opts.skipStartupTiming
+      ? Array.from(metricsSelection).filter((id) => id !== 'startup_timing')
+      : Array.from(metricsSelection)
     try {
       const result = await startSession(
         selected.id,
@@ -180,7 +249,7 @@ export function LiveView({
         // Snapshot the picker at recording start so the History view
         // of this session always reflects "what the user was focused
         // on at the time", independent of later picker changes.
-        Array.from(metricsSelection),
+        metricsForSession,
         // Same snapshot principle for per-card sampling cadence —
         // the session's samplers run at these intervals and the
         // History view shows what was actually captured.
@@ -189,6 +258,12 @@ export function LiveView({
       setActiveSessionId(result.session_id)
       if (result.startup) {
         setAutoStartup(result.startup)
+        // Stamp the cooldown only on iOS cold paths — Android's
+        // `am start -W` doesn't acquire kperf, hot path doesn't
+        // either (no coreprofile session opened).
+        if (selected.platform === 'ios' && result.startup.mode === 'cold') {
+          cooldown.recordColdMeasurement()
+        }
       }
       const startupNote = result.startup
         ? ` · ${result.startup.mode === 'cold' ? '冷' : '热'}启动 ${result.startup.total_ms}ms`
@@ -491,6 +566,44 @@ export function LiveView({
   return (
     <Layout style={{ flex: 1, minWidth: 0 }}>
       {toast}
+      <Modal
+        title="冷启动测量冷却中"
+        visible={pendingStart != null}
+        onCancel={() => setPendingStart(null)}
+        footer={
+          <Space>
+            <Button onClick={() => setPendingStart(null)}>取消</Button>
+            <Button
+              onClick={() => {
+                setPendingStart(null)
+                void actuallyStartSession({ skipStartupTiming: true })
+              }}
+            >
+              跳过启动时间,立即开始
+            </Button>
+            <Button
+              type="primary"
+              loading={cooldown.inCooldown}
+              disabled={cooldown.inCooldown}
+              onClick={() => {
+                if (cooldown.inCooldown) return
+                setPendingStart(null)
+                void actuallyStartSession({ skipStartupTiming: false })
+              }}
+            >
+              {cooldown.inCooldown
+                ? `等待 ${cooldown.remainingSec}s 后开始`
+                : '立即开始(冷却已结束)'}
+            </Button>
+          </Space>
+        }
+      >
+        <Typography.Text>
+          距上次冷启动测量不到 35 秒(还需 {cooldown.remainingSec}s),iOS 内核
+          kperf 锁还未释放,此时开始录制会导致冷启动时间测量失败。
+          其他指标不受影响,仍会正常采集。
+        </Typography.Text>
+      </Modal>
       <Sider
         width={sidebar.width}
         style={{
@@ -551,7 +664,10 @@ export function LiveView({
                 type="primary"
                 icon={<Play size={12} />}
                 onClick={handleStart}
-                disabled={!selected || !selected.usable || !targetPkg}
+                loading={probingStartupMode}
+                disabled={
+                  !selected || !selected.usable || !targetPkg || probingStartupMode
+                }
                 title={
                   !selected
                     ? 'Pick a device first.'
@@ -559,10 +675,12 @@ export function LiveView({
                       ? 'iOS via Wi-Fi only — connect over USB to enable sampling.'
                       : !targetPkg
                         ? 'Pick a target app first.'
-                        : undefined
+                        : probingStartupMode
+                          ? '检测启动模式中…'
+                          : undefined
                 }
               >
-                Start
+                {probingStartupMode ? '检测中' : 'Start'}
               </Button>
             )}
             <Button
@@ -689,6 +807,7 @@ export function LiveView({
               screenshotOn={metricsSelection.has('screenshot')}
               startupTimingOn={metricsSelection.has('startup_timing')}
               autoStartup={autoStartup}
+              cooldownRemainingSec={cooldown.remainingSec}
             />
             {/*
               Each chart card is gated by its metrics-picker id and

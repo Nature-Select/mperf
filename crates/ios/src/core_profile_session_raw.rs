@@ -807,13 +807,23 @@ pub async fn invalidate_session(_udid: &str) {
 /// Generate an upper-case UUID-4 string — used as the `uuid` field
 /// of the trace config. Apple's parser cares about the format
 /// (uppercase hex with dashes); the value itself is opaque.
+///
+/// Two `uuid_string()` calls fired back-to-back (e.g. inside
+/// `send_set_config`) can hit the same nanosecond on fast hardware,
+/// which would yield identical UUIDs from a pure-time seed. We mix
+/// in a monotonic counter so successive calls are guaranteed unique
+/// regardless of clock resolution.
 fn uuid_string() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let mut x = nanos.wrapping_mul(0x9E3779B97F4A7C15);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let seed = nanos ^ counter.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15);
     let mut bytes = [0u8; 16];
     for b in bytes.iter_mut() {
         x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
