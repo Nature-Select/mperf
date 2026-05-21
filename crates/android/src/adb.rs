@@ -14,12 +14,23 @@ fn adb_binary() -> String {
     std::env::var("MPERF_ADB_PATH").unwrap_or_else(|_| "adb".to_string())
 }
 
-/// Build a `Command` for the bundled adb. On Windows we attach
-/// CREATE_NO_WINDOW so each spawn doesn't flash a console window —
-/// during recording the samplers fire several adb calls per second and
-/// without this flag the user sees a continuous black-window flicker.
+/// Build a `Command` for the bundled adb.
+///
+/// On Windows we attach CREATE_NO_WINDOW so each spawn doesn't flash a
+/// console window — during recording the samplers fire several adb
+/// calls per second and without this flag the user sees a continuous
+/// black-window flicker.
+///
+/// `kill_on_drop(true)` is mandatory: when a caller wraps the spawn
+/// in `tokio::time::timeout(...)` and the timeout fires, the Future
+/// is dropped but Tokio does **not** kill the spawned process by
+/// default — it just stops `.await`ing it. The orphaned `adb shell`
+/// keeps running, talking to the device, and any subsequent shell
+/// call queues behind it. On Samsung One UI's adbd this exact
+/// pile-up reproduced "Live view spinners forever, PerfDog stuck
+/// too" in the field. With kill_on_drop on, the OS SIGKILLs the
+/// stale shell as soon as the timeout drops the future.
 pub(crate) fn adb_command() -> Command {
-    #[allow(unused_mut)]
     let mut cmd = Command::new(adb_binary());
     #[cfg(target_os = "windows")]
     {
@@ -27,6 +38,7 @@ pub(crate) fn adb_command() -> Command {
         // pulling in the `windows-sys` crate for a single constant.
         cmd.creation_flags(0x0800_0000);
     }
+    cmd.kill_on_drop(true);
     cmd
 }
 

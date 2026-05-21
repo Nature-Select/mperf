@@ -15,5 +15,9 @@ smallvec = { workspace = true }
 tracing = { workspace = true }
 
 idevice = { workspace = true }
+ns-keyed-archive = "0.1"
 plist = "1"
 mperf-schema = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

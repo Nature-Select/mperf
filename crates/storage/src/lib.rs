@@ -112,6 +112,67 @@ impl Storage {
         Ok(id)
     }
 
+    /// Record (or replace) a single startup-timing measurement for the
+    /// session. Mode is the string `"cold"` or `"hot"` — anything else
+    /// is rejected so we don't quietly drop the wrong column. Read-
+    /// modify-write under a transaction so a `cold` measurement
+    /// followed by a `hot` measurement doesn't overwrite the first.
+    pub async fn record_startup_timing(
+        &self,
+        session_id: i64,
+        mode: &str,
+        total_ms: u64,
+    ) -> Result<()> {
+        let mode = mode.to_string();
+        if mode != "cold" && mode != "hot" {
+            anyhow::bail!("unknown startup mode {mode:?}; expected \"cold\" or \"hot\"");
+        }
+        self.conn
+            .call(move |c| {
+                let tx = c.transaction()?;
+                let existing: Option<String> = tx
+                    .query_row(
+                        "SELECT startup_timings FROM sessions WHERE id = ?",
+                        params![session_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let mut current: crate::model::StartupTimings = existing
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or_default();
+                match mode.as_str() {
+                    "cold" => current.cold_ms = Some(total_ms),
+                    "hot" => current.hot_ms = Some(total_ms),
+                    _ => unreachable!("mode validated above"),
+                }
+                let json = serde_json::to_string(&current).expect("StartupTimings serialises");
+                let affected = tx.execute(
+                    "UPDATE sessions SET startup_timings = ? WHERE id = ?",
+                    params![json, session_id],
+                )?;
+                // Guard against silently succeeding when the session
+                // row no longer exists (e.g. caller raced a delete).
+                // Without this, RMW reads default-empty timings, UPDATE
+                // matches 0 rows, commit returns Ok — and the caller
+                // believes the measurement was persisted.
+                if affected == 0 {
+                    return Err(tokio_rusqlite::Error::Other(
+                        format!(
+                            "record_startup_timing: session {session_id} not found"
+                        )
+                        .into(),
+                    ));
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+            .context("record startup timing")?;
+        Ok(())
+    }
+
     /// Mark a session finished. Idempotent: a row whose `wall_end_ms` is
     /// already non-null keeps its existing timestamp. Both paths into
     /// this function (writer-task auto-finalize on broadcast close and
@@ -190,12 +251,14 @@ impl Storage {
             .call(|c| {
                 let mut stmt = c.prepare(
                     "SELECT id, wall_start_ms, wall_end_ms, device_id, device_platform,
-                            device_model, app_bundle_id, selected_metrics, sampling_intervals
+                            device_model, app_bundle_id, selected_metrics, sampling_intervals,
+                            startup_timings
                      FROM sessions ORDER BY wall_start_ms DESC",
                 )?;
                 let it = stmt.query_map([], |row| {
                     let selected_json: Option<String> = row.get(7)?;
                     let intervals_json: Option<String> = row.get(8)?;
+                    let startup_json: Option<String> = row.get(9)?;
                     Ok(SessionInfo {
                         id: row.get(0)?,
                         wall_start_ms: row.get(1)?,
@@ -206,6 +269,7 @@ impl Storage {
                         app_bundle_id: row.get(6)?,
                         selected_metrics: parse_selected_metrics(selected_json),
                         sampling_intervals: parse_sampling_intervals(intervals_json),
+                        startup_timings: parse_startup_timings(startup_json),
                     })
                 })?;
                 let mut out = Vec::new();
@@ -225,12 +289,14 @@ impl Storage {
             .call(move |c| {
                 c.query_row(
                     "SELECT id, wall_start_ms, wall_end_ms, device_id, device_platform,
-                            device_model, app_bundle_id, selected_metrics, sampling_intervals
+                            device_model, app_bundle_id, selected_metrics, sampling_intervals,
+                            startup_timings
                      FROM sessions WHERE id = ?",
                     params![id],
                     |row| {
                         let selected_json: Option<String> = row.get(7)?;
                         let intervals_json: Option<String> = row.get(8)?;
+                        let startup_json: Option<String> = row.get(9)?;
                         Ok(SessionInfo {
                             id: row.get(0)?,
                             wall_start_ms: row.get(1)?,
@@ -241,6 +307,7 @@ impl Storage {
                             app_bundle_id: row.get(6)?,
                             selected_metrics: parse_selected_metrics(selected_json),
                             sampling_intervals: parse_sampling_intervals(intervals_json),
+                            startup_timings: parse_startup_timings(startup_json),
                         })
                     },
                 )
@@ -468,6 +535,17 @@ fn parse_sampling_intervals(raw: Option<String>) -> Option<std::collections::Has
         Ok(m) => Some(m),
         Err(e) => {
             tracing::warn!(error = %e, raw = %s, "sampling_intervals JSON parse failed; treating as 'default frequencies'");
+            None
+        }
+    }
+}
+
+fn parse_startup_timings(raw: Option<String>) -> Option<crate::model::StartupTimings> {
+    let s = raw?;
+    match serde_json::from_str::<crate::model::StartupTimings>(&s) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::warn!(error = %e, raw = %s, "startup_timings JSON parse failed; treating as 'no measurements'");
             None
         }
     }

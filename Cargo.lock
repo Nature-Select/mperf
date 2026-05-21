@@ -2214,11 +2214,13 @@ dependencies = [
  "futures-core",
  "idevice",
  "mperf-schema",
+ "ns-keyed-archive",
  "plist",
  "serde",
  "smallvec",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

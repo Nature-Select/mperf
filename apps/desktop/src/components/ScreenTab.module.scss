@@ -38,33 +38,42 @@
   opacity: 0.7;
 }
 
-.timingRow {
+.startupSection {
   display: flex;
-  align-items: center;
-  gap: 18px;
-  padding: 0 4px;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 4px;
 }
 
-.timingCell {
-  display: inline-flex;
+.startupRow {
+  display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 8px;
   font-size: 12px;
   color: var(--color-text-2);
 }
 
-.timingLabel {
+.startupLabel {
   color: var(--color-text-3);
+  min-width: 56px;
 }
 
-.timingValue {
+.startupValue {
   color: var(--color-text-1);
   font-variant-numeric: tabular-nums;
-  min-width: 14px;
-  text-align: right;
+  min-width: 64px;
 }
 
-.timingHint {
+.startupType {
+  color: var(--color-text-3);
+}
+
+.startupHint {
   color: var(--color-text-3);
   cursor: help;
+}
+
+.startupCooldown {
+  color: rgb(var(--orange-6));
+  font-variant-numeric: tabular-nums;
 }

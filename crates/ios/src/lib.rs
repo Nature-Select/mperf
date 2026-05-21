@@ -13,11 +13,13 @@ mod apps;
 #[allow(dead_code)]
 mod battery;
 mod connect;
+mod core_profile_session_raw;
 mod cpu;
 mod devices;
 mod graphics;
 mod graphics_raw;
 mod launch;
+mod startup;
 mod os_trace;
 mod pid_resolver;
 // `syslog_relay` proved too sparse on modern iOS — virtually every
@@ -36,7 +38,16 @@ pub use cpu::{resolve_bundle_to_exec, CpuSampler};
 pub use devices::{device_info, list_devices};
 pub use graphics::GraphicsSampler;
 pub use launch::launch_app;
+pub use startup::{measure_cold_start, measure_hot_start, StartupTiming};
 pub use os_trace::{fetch_active_pids, OsTraceStream};
 pub use pid_resolver::{resolve_bundle_to_pids, BundleResolution};
 #[allow(unused_imports)]
 pub use syslog::SyslogStream;
+
+/// Re-exports for `cargo run --example` harnesses that exercise low-
+/// level DTX paths against a real device. Not part of the public API
+/// for desktop / consumers — `#[doc(hidden)]` keeps it out of docs.
+#[doc(hidden)]
+pub mod testing {
+    pub use crate::connect::provider_for;
+}

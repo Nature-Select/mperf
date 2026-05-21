@@ -108,6 +108,15 @@ export function listDevices(): Promise<Device[]> {
   return invoke<Device[]>('list_devices')
 }
 
+export interface StartSessionResponse {
+  session_id: number
+  /// Present only when `selected_metrics` included `"startup_timing"`
+  /// AND the auto-measurement succeeded. UI uses this to populate
+  /// the ScreenTab startup row immediately on Start — no need to
+  /// click "测试" manually.
+  startup?: { mode: StartupMode; total_ms: number }
+}
+
 export function startSession(
   deviceId: string,
   platform: Platform,
@@ -124,8 +133,8 @@ export function startSession(
   /// which case the sampler runs at the fastest requested rate.
   /// `undefined` ⇒ samplers use their hardcoded defaults.
   samplingIntervals?: Record<string, number>,
-): Promise<number> {
-  return invoke<number>('start_session', {
+): Promise<StartSessionResponse> {
+  return invoke<StartSessionResponse>('start_session', {
     deviceId,
     platform,
     deviceModel,
@@ -184,6 +193,53 @@ export interface SessionInfo {
   /// start. `null` on pre-v6 sessions; UI may surface "录制频率"
   /// info in the session header when present.
   sampling_intervals: Record<string, number> | null
+  /// User-triggered cold/hot startup measurements recorded during
+  /// this session. Either field may be absent if only one mode was
+  /// measured (or none).
+  startup_timings: { cold_ms?: number; hot_ms?: number } | null
+}
+
+export type StartupMode = 'cold' | 'hot'
+
+export interface StartupMeasurement {
+  total_ms: number
+  mode: StartupMode
+  /// Session id this measurement was persisted to. `null` when no
+  /// session was recording at measurement time — the value still
+  /// returns for live display but doesn't survive a reload.
+  persisted_to_session: number | null
+}
+
+export function measureStartup(
+  deviceId: string,
+  platform: Platform,
+  targetPkg: string,
+  mode: StartupMode,
+): Promise<StartupMeasurement> {
+  return invoke<StartupMeasurement>('measure_startup', {
+    deviceId,
+    platform,
+    targetPkg,
+    mode,
+  })
+}
+
+/// Cheap probe — would the next start_session walk cold or hot? Used
+/// to suppress the iOS-kperf cooldown Modal when the imminent launch
+/// is actually hot (which doesn't open a coreprofile session and so
+/// doesn't compete for the kperf lock). Android: `pidof`. iOS:
+/// `resolve_bundle_to_pids` (DTX, ~1-2s — slow, so caller should
+/// only ask when it matters, e.g. inside the cooldown window).
+export function detectStartupMode(
+  deviceId: string,
+  platform: Platform,
+  targetPkg: string,
+): Promise<StartupMode> {
+  return invoke<StartupMode>('detect_startup_mode', {
+    deviceId,
+    platform,
+    targetPkg,
+  })
 }
 
 export interface SamplePoint {

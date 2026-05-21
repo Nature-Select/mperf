@@ -46,6 +46,137 @@ pub async fn get_device_info(
     }
 }
 
+#[derive(Serialize)]
+pub struct StartupMeasurement {
+    /// Total app-launch time, ms. Android: `am start -W` TotalTime.
+    /// iOS: wall-clock around the processcontrol launch RPC.
+    total_ms: u64,
+    /// Echoes back the mode the measurement was requested in
+    /// (`"cold"` / `"hot"`) so the UI can label the result without
+    /// remembering which call it dispatched.
+    mode: String,
+    /// `Some(id)` if the measurement was also persisted to a currently
+    /// active session row. `None` when no session was recording at
+    /// measurement time — the user still sees the number, it just
+    /// won't survive a reload.
+    persisted_to_session: Option<i64>,
+}
+
+/// Measure cold or hot app-launch latency. `mode` accepts `"cold"`
+/// (force-restart the process and time the relaunch) or `"hot"` (resume
+/// an existing process / bring it to the foreground without killing).
+///
+/// If a recording session is currently active **and** its target app
+/// matches `target_pkg`, the measurement is also persisted to the
+/// session's `startup_timings` JSON column. Cross-app measurement
+/// during a different recording is allowed but not persisted — that
+/// would taint the active session's "what was measured" record.
+/// Cheap probe: would the next `start_session` walk the cold or hot
+/// branch? Same logic as `session::measure_startup_for_start_session`
+/// — Android `pidof` / iOS `resolve_bundle_to_pids`. Returns "cold"
+/// when the probe says the app isn't running OR when the probe
+/// errors (matches the conservative fallback inside start_session,
+/// which assumes cold on probe failure).
+///
+/// Frontend uses this DURING the iOS kperf cooldown window to decide
+/// whether to show the "still cooling down" Modal: only relevant
+/// when the imminent record will actually open a coreprofile
+/// session, i.e. cold. Hot launches don't acquire kperf.
+#[tauri::command]
+pub async fn detect_startup_mode(
+    device_id: String,
+    platform: Platform,
+    target_pkg: String,
+) -> Result<String, String> {
+    let target_pkg = target_pkg.trim().to_string();
+    if target_pkg.is_empty() {
+        return Err("a target app must be selected".into());
+    }
+    let is_running = match platform {
+        Platform::Android => matches!(
+            mperf_android::pidof(&device_id, &target_pkg).await,
+            Ok(Some(_))
+        ),
+        Platform::Ios => match mperf_ios::resolve_bundle_to_pids(&device_id, &target_pkg).await {
+            Ok(r) => !r.pids.is_empty(),
+            Err(_) => false,
+        },
+    };
+    Ok(if is_running { "hot" } else { "cold" }.to_string())
+}
+
+#[tauri::command]
+pub async fn measure_startup(
+    state: State<'_, AppState>,
+    device_id: String,
+    platform: Platform,
+    target_pkg: String,
+    mode: String,
+) -> Result<StartupMeasurement, String> {
+    let target_pkg = target_pkg.trim().to_string();
+    if target_pkg.is_empty() {
+        return Err("a target app must be selected to measure startup".into());
+    }
+    let mode_norm = match mode.as_str() {
+        "cold" | "hot" => mode.clone(),
+        other => return Err(format!("unknown mode {other:?}; expected \"cold\" or \"hot\"")),
+    };
+    tracing::info!(device_id = %device_id, ?platform, target_pkg = %target_pkg, mode = %mode_norm, "measure_startup");
+
+    let total_ms = match platform {
+        Platform::Android => match mode_norm.as_str() {
+            "cold" => mperf_android::measure_cold_start(&device_id, &target_pkg)
+                .await
+                .map_err(|e| e.to_string())?
+                .total_ms,
+            "hot" => mperf_android::measure_hot_start(&device_id, &target_pkg)
+                .await
+                .map_err(|e| e.to_string())?
+                .total_ms,
+            _ => unreachable!(),
+        },
+        Platform::Ios => match mode_norm.as_str() {
+            "cold" => mperf_ios::measure_cold_start(&device_id, &target_pkg)
+                .await
+                .map_err(|e| e.to_string())?
+                .total_ms,
+            "hot" => mperf_ios::measure_hot_start(&device_id, &target_pkg)
+                .await
+                .map_err(|e| e.to_string())?
+                .total_ms,
+            _ => unreachable!(),
+        },
+    };
+
+    // Persist to the active session row only when the measurement is
+    // for the same app the session is recording — otherwise we'd be
+    // labelling a different app's startup as "this session's startup".
+    let persisted_to_session = {
+        let guard = state.session.lock().await;
+        match guard.as_ref() {
+            Some(s) if s.app_bundle_id.as_deref() == Some(target_pkg.as_str()) => Some(s.db_id),
+            _ => None,
+        }
+    };
+    if let Some(db_id) = persisted_to_session {
+        if let Err(e) = state
+            .storage
+            .record_startup_timing(db_id, &mode_norm, total_ms)
+            .await
+        {
+            // Don't fail the whole RPC for a persistence hiccup; the
+            // user still sees the measurement, just lost the durability.
+            tracing::warn!(error = %e, db_id, "record_startup_timing failed");
+        }
+    }
+
+    Ok(StartupMeasurement {
+        total_ms,
+        mode: mode_norm,
+        persisted_to_session,
+    })
+}
+
 #[tauri::command]
 pub async fn list_apps(
     device_id: String,
@@ -98,7 +229,7 @@ pub async fn start_session(
     target_pkg: String,
     selected_metrics: Option<Vec<String>>,
     sampling_intervals: Option<std::collections::HashMap<String, u64>>,
-) -> Result<i64, String> {
+) -> Result<session::StartSessionResponse, String> {
     // PerfDog-style: app selection is mandatory. Frontend disables Start
     // until both device + app are picked; this is the backend guard.
     let target_pkg = target_pkg.trim().to_string();

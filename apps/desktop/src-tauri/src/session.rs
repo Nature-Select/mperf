@@ -47,6 +47,10 @@ pub struct Session {
     /// Wall-clock ms when the session was created. Markers compute their
     /// `ts_us` (offset from session start) as `(now_ms - wall_start_ms) * 1000`.
     pub wall_start_ms: i64,
+    /// Bundle id of the app the session is recording. `measure_startup`
+    /// checks this before persisting a startup timing — we only attach
+    /// the measurement to the session if it's for the same app.
+    pub app_bundle_id: Option<String>,
     scheduler: SchedulerHandle,
     writer_task: Option<JoinHandle<()>>,
     /// Set true right before we tear down the scheduler from a
@@ -78,6 +82,101 @@ struct SessionEndedPayload {
     reason: String,
 }
 
+/// Surfaced to the frontend as part of `StartSessionResponse` so the
+/// UI can populate the ScreenTab startup row immediately on Start —
+/// without this the user'd have to manually click "测试" even though
+/// the launch they just triggered already had the data.
+#[derive(Debug, Clone, Serialize)]
+pub struct AutoMeasuredStartup {
+    pub mode: String,
+    pub total_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StartSessionResponse {
+    pub session_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup: Option<AutoMeasuredStartup>,
+}
+
+/// Detect whether the target app's process is currently running, then
+/// run the matching measurement (cold if not running, hot if running)
+/// — replaces the plain launch_app for the `startup_timing` opt-in
+/// path. Returns `(mode, total_ms)` on success, `None` on any failure
+/// (which falls back to "launch happened, just no timing recorded").
+async fn measure_startup_for_start_session(
+    platform: Platform,
+    device_id: &str,
+    target_pkg: &str,
+) -> Option<(&'static str, u64)> {
+    match platform {
+        Platform::Android => {
+            // pidof returns the PID(s) of any running process matching
+            // the package, empty otherwise. Either failure mode is
+            // treated as "not running" — worst case we mis-label a
+            // hot launch as cold, the data still shows up.
+            let is_running = matches!(
+                mperf_android::pidof(device_id, target_pkg).await,
+                Ok(Some(_))
+            );
+            let (mode, result) = if is_running {
+                tracing::info!(target_pkg = %target_pkg, "startup_timing: app running → hot");
+                (
+                    "hot",
+                    mperf_android::measure_hot_start(device_id, target_pkg).await,
+                )
+            } else {
+                tracing::info!(target_pkg = %target_pkg, "startup_timing: app not running → cold");
+                (
+                    "cold",
+                    mperf_android::measure_cold_start(device_id, target_pkg).await,
+                )
+            };
+            match result {
+                Ok(t) => Some((mode, t.total_ms)),
+                Err(e) => {
+                    tracing::warn!(error = %e, mode, "startup_timing: measurement failed (continuing without)");
+                    None
+                }
+            }
+        }
+        Platform::Ios => {
+            // resolve_bundle_to_pids opens its own DTX channel (~1-2s)
+            // to enumerate running PIDs for the bundle. Heavier than
+            // Android's pidof but acceptable — the launch itself
+            // already pays a similar DTX setup cost.
+            let is_running = match mperf_ios::resolve_bundle_to_pids(device_id, target_pkg).await
+            {
+                Ok(r) => !r.pids.is_empty(),
+                Err(e) => {
+                    tracing::debug!(error = %e, "startup_timing: pid probe failed, assuming cold");
+                    false
+                }
+            };
+            let (mode, result) = if is_running {
+                tracing::info!(target_pkg = %target_pkg, "startup_timing: app running → hot");
+                (
+                    "hot",
+                    mperf_ios::measure_hot_start(device_id, target_pkg).await,
+                )
+            } else {
+                tracing::info!(target_pkg = %target_pkg, "startup_timing: app not running → cold");
+                (
+                    "cold",
+                    mperf_ios::measure_cold_start(device_id, target_pkg).await,
+                )
+            };
+            match result {
+                Ok(t) => Some((mode, t.total_ms)),
+                Err(e) => {
+                    tracing::warn!(error = %e, mode, "startup_timing: measurement failed (continuing without)");
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Start a new recording session: build samplers, create DB row, spin up
 /// the scheduler + writer + UI pump tasks, and atomically replace any
 /// prior session in `AppState`. Returns the newly-assigned DB id.
@@ -90,7 +189,7 @@ pub async fn start_recording(
     target_pkg: String,
     selected_metrics: Option<Vec<String>>,
     sampling_intervals: Option<std::collections::HashMap<String, u64>>,
-) -> Result<i64, String> {
+) -> Result<StartSessionResponse, String> {
     tracing::info!(
         device_id = %device_id,
         ?platform,
@@ -108,16 +207,36 @@ pub async fn start_recording(
     // iOS launch adds ~1-2s to start time because it has to build a
     // fresh CoreDeviceProxy + RSD + dtservicehub channel just for the
     // one launch call. Unavoidable — that's the protocol cost.
-    match platform {
-        Platform::Android => match mperf_android::launch_app(&device_id, &target_pkg).await {
-            Ok(()) => tracing::info!(target_pkg = %target_pkg, "android: launched via monkey"),
-            Err(e) => tracing::warn!(error = %e, target_pkg = %target_pkg, "android: launch failed (continuing)"),
-        },
-        Platform::Ios => match mperf_ios::launch_app(&device_id, &target_pkg).await {
-            Ok(pid) => tracing::info!(target_pkg = %target_pkg, pid, "ios: launched via processcontrol"),
-            Err(e) => tracing::warn!(error = %e, target_pkg = %target_pkg, "ios: launch failed (continuing)"),
-        },
-    }
+    //
+    // If the user picked `startup_timing` in the picker, replace the
+    // plain launch with an instrumented measure that times the launch
+    // and persists the result to the session row below. Mode (cold /
+    // hot) is auto-detected by checking whether the target app's
+    // process is already running BEFORE we launch:
+    //   - Android: `pidof <pkg>` (cheap, one adb shell)
+    //   - iOS:     resolve_bundle_to_pids (~1-2s DTX call) — slow but
+    //     the user's already eating ~2s for the launch DTX channel,
+    //     so the extra hop on top is bearable for the accurate label
+    let wants_startup_timing = selected_metrics
+        .as_ref()
+        .map(|v| v.iter().any(|id| id == "startup_timing"))
+        .unwrap_or(false);
+    let auto_startup: Option<(&'static str, u64)> = if wants_startup_timing {
+        measure_startup_for_start_session(platform, &device_id, &target_pkg).await
+    } else {
+        // No timing wanted — keep the original plain-launch behaviour.
+        match platform {
+            Platform::Android => match mperf_android::launch_app(&device_id, &target_pkg).await {
+                Ok(()) => tracing::info!(target_pkg = %target_pkg, "android: launched via monkey"),
+                Err(e) => tracing::warn!(error = %e, target_pkg = %target_pkg, "android: launch failed (continuing)"),
+            },
+            Platform::Ios => match mperf_ios::launch_app(&device_id, &target_pkg).await {
+                Ok(pid) => tracing::info!(target_pkg = %target_pkg, pid, "ios: launched via processcontrol"),
+                Err(e) => tracing::warn!(error = %e, target_pkg = %target_pkg, "ios: launch failed (continuing)"),
+            },
+        }
+        None
+    };
 
     let intervals_for_samplers = sampling_intervals.clone().unwrap_or_default();
     let samplers = build_samplers(&device_id, platform, target_pkg.clone(), &intervals_for_samplers);
@@ -178,6 +297,7 @@ pub async fn start_recording(
         *guard = Some(Session {
             db_id,
             wall_start_ms: session_wall_start_ms,
+            app_bundle_id: Some(target_pkg.clone()),
             scheduler: handle,
             writer_task: Some(writer_task),
             user_stopping,
@@ -189,7 +309,26 @@ pub async fn start_recording(
         tokio::spawn(async move { old.stop(&storage).await });
     }
 
-    Ok(db_id)
+    // Persist the auto-measured startup timing (if any) to the session
+    // row now that we have a db_id. Failure here is logged but doesn't
+    // fail the Start — the recording is already running, and the user
+    // can re-measure with the manual button.
+    let startup_for_response = if let Some((mode, total_ms)) = auto_startup {
+        if let Err(e) = state.storage.record_startup_timing(db_id, mode, total_ms).await {
+            tracing::warn!(error = %e, db_id, "record_startup_timing failed during start_session");
+        }
+        Some(AutoMeasuredStartup {
+            mode: mode.to_string(),
+            total_ms,
+        })
+    } else {
+        None
+    };
+
+    Ok(StartSessionResponse {
+        session_id: db_id,
+        startup: startup_for_response,
+    })
 }
 
 fn build_samplers(
